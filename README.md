@@ -4,7 +4,7 @@ An AI-assisted emergency escalation **prototype** for people with Type 1 diabete
 built around Gemma as the natural-language core of its emergency communication
 workflow.
 
-> **⚠️ Hackathon prototype. Not a medical device.** GlucoRelay does not
+> ** Hackathon prototype. Not a medical device.** GlucoRelay does not
 > diagnose, treat, or manage diabetes. It does not contact emergency
 > services. It simulates glucose readings and caregiver notifications for
 > demonstration purposes only.
