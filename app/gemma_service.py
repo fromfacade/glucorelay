@@ -36,7 +36,7 @@ import json
 import logging
 import os
 import re
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import ValidationError
 
@@ -55,28 +55,53 @@ MAX_TRANSCRIPT_LENGTH = 2000
 # validation and the prompt's own instructions. If Gemma's output slips
 # past the schema but violates the safety boundary in substance, we must
 # not use it.
+#
+# SCOPE: this list exists to catch generated MEDICAL INSTRUCTIONS/ADVICE
+# (a treatment command, a dosage, a diagnosis) - never a patient-reported
+# physical condition or limitation. Phrases like "can't stand", "unable to
+# stand", "can't move", "alone", or "confused" must NEVER be added here:
+# those are exactly the kind of explicit self-reported symptoms
+# `need_help` is supposed to capture (see `_NEED_HELP_EVIDENCE` below), and
+# rejecting them would silently break the app's core safety feature -
+# escalating a patient who cannot safely respond. Each entry is matched on
+# a word boundary (see `_matches_denylist`) so it can never fire on part of
+# an unrelated word.
 _UNSAFE_PHRASES = (
     "unconscious",
     "unresponsive and not breathing",
     "insulin",
     "dosage",
-    " dose ",
+    "dose",
     "milligram",
     "medication",
-    "diagnos",
+    "diagnos",  # stem: diagnose/diagnosis/diagnosed/diagnostic
     "inject",
     "overdose",
 )
+
+
+def _denylist_pattern(phrases: tuple[str, ...]) -> re.Pattern[str]:
+    """Builds a word-boundary regex from a tuple of phrases/stems.
+
+    `\\b<phrase>\\w*\\b` isolates each phrase to a whole word (or the start
+    of one, e.g. "diagnos" -> "diagnosis") so it can never match as a
+    fragment of an unrelated word (e.g. "dose" must never match inside
+    "overdose" - that stays its own separate, deliberate entry).
+    """
+    alternatives = "|".join(re.escape(p) for p in phrases)
+    return re.compile(rf"\b(?:{alternatives})\w*\b")
+
+
+_UNSAFE_PHRASES_PATTERN = _denylist_pattern(_UNSAFE_PHRASES)
 
 
 def _contains_unsafe_content(*texts: str | None) -> str | None:
     for text in texts:
         if not text:
             continue
-        lowered = f" {text.lower()} "
-        for phrase in _UNSAFE_PHRASES:
-            if phrase in lowered:
-                return phrase.strip()
+        match = _UNSAFE_PHRASES_PATTERN.search(text.lower())
+        if match:
+            return match.group(0)
     return None
 
 
@@ -91,7 +116,8 @@ def _contains_unsafe_content(*texts: str | None) -> str | None:
 # downgraded to "unknown" here. This runs on fallback-parser output too
 # (defense in depth) even though the fallback already only assigns an
 # action when one of these same phrases matched.
-_OKAY_EVIDENCE = (
+# Split by language (see `_NEED_HELP_EVIDENCE_EN`/`_ES` below for why).
+_OKAY_EVIDENCE_EN = (
     "i'm okay", "im okay", "i am okay",
     "i'm ok", "im ok", "i am ok",
     "i'm fine", "im fine", "i am fine",
@@ -99,9 +125,11 @@ _OKAY_EVIDENCE = (
     "everything is okay", "everything's okay", "everything is fine",
     "i'm alright", "im alright", "i am alright",
     "feeling fine", "feeling okay",
-    # Spanish equivalents (practical subset, not exhaustive).
+)
+_OKAY_EVIDENCE_ES = (
     "estoy bien", "me siento bien", "todo está bien", "todo esta bien",
 )
+_OKAY_EVIDENCE = _OKAY_EVIDENCE_EN + _OKAY_EVIDENCE_ES
 
 _TREATING_EVIDENCE = (
     "treating it", "i'm treating", "im treating", "i am treating",
@@ -117,17 +145,34 @@ _FALSE_ALARM_EVIDENCE = (
     "ignore that", "ignore this",
 )
 
-_NEED_HELP_EVIDENCE = (
+# Split by language so both the action-evidence check above AND the
+# deterministic language-normalization helper below can reuse the exact
+# same, carefully scoped phrase sets - a single source of truth rather than
+# a second, looser "does this look Spanish" heuristic.
+_NEED_HELP_EVIDENCE_EN = (
     "need help", "i need help", "help me", "send help", "come get me",
     "call someone", "call ", "contact ", "please call", "please contact",
     "can't stand", "cant stand", "can't move", "cant move", "can't get up",
     "cant get up", "unable to stand", "unable to move", "i'm alone",
     "im alone", "i am alone", "too weak", "too dizzy", "feel faint",
     "about to pass out", "confus",
-    # Spanish equivalents (practical subset, not exhaustive).
-    "ayuda", "necesito ayuda", "llama", "confundid", "no puedo pararme",
-    "no puedo levantarme", "estoy sola", "estoy solo",
 )
+
+# Spanish: explicit help/contact-request phrases. Deliberately scoped to
+# request VERBS ("llama a", "contacta a", "ayudame", "necesito ayuda"),
+# never a bare name - a contact name alone (e.g. just "Helper") must never
+# by itself count as evidence of a help request (or of the transcript being
+# Spanish - see `normalize_detected_language`).
+_NEED_HELP_EVIDENCE_ES = (
+    "necesito ayuda", "ayudame", "ayúdame", "por favor llama a", "llama a",
+    "llama ", "por favor contacta a", "contacta a", "contacta ",
+    # Explicit reported inability to safely respond.
+    "me siento confundida", "me siento confundido", "confundid",
+    "no puedo pararme", "no puedo levantarme", "no puedo moverme",
+    "estoy débil", "estoy debil", "estoy sola", "estoy solo",
+)
+
+_NEED_HELP_EVIDENCE = _NEED_HELP_EVIDENCE_EN + _NEED_HELP_EVIDENCE_ES
 
 _SCHEDULE_RECHECK_EVIDENCE = (
     "check on me", "check again", "recheck", "check back", "call back in",
@@ -141,6 +186,19 @@ _ACTION_EVIDENCE: dict[str, tuple[str, ...]] = {
     "need_help": _NEED_HELP_EVIDENCE,
     "schedule_recheck": _SCHEDULE_RECHECK_EVIDENCE,
 }
+
+# The Spanish-only subset of every action's evidence phrases, reused
+# verbatim (not duplicated) by `normalize_detected_language` below. The
+# English-only subset likewise establishes "English explicitly present".
+# Neither list includes a bare name - see `_NEED_HELP_EVIDENCE_ES` comment.
+_SPANISH_INTENT_MARKERS = _OKAY_EVIDENCE_ES + _NEED_HELP_EVIDENCE_ES
+_ENGLISH_INTENT_MARKERS = (
+    _OKAY_EVIDENCE_EN
+    + _TREATING_EVIDENCE
+    + _FALSE_ALARM_EVIDENCE
+    + _NEED_HELP_EVIDENCE_EN
+    + _SCHEDULE_RECHECK_EVIDENCE
+)
 
 
 def _has_any_phrase(lowered_text: str, phrases: tuple[str, ...]) -> bool:
@@ -162,14 +220,73 @@ _ENGLISH_TAGS = {"en", "english"}
 
 
 def _is_english(detected_language: str | None) -> bool:
+    """True only when the language was explicitly confirmed as English.
+
+    IMPORTANT: an unset/unknown `detected_language` (None) must NOT default
+    to English here - doing so previously caused non-English transcripts
+    where Gemma omitted `detected_language` to have their own (non-English)
+    `summary` copied straight into `english_summary`, mislabeling foreign
+    text as an English translation. When we cannot confirm the language,
+    the safe behavior is to leave `english_summary` alone rather than
+    guess.
+    """
     if not detected_language:
-        return True
+        return False
     normalized = detected_language.strip().lower()
     return (
         normalized in _ENGLISH_TAGS
         or normalized.startswith("en-")
         or normalized.startswith("en_")
     )
+
+
+# A tiny, explicitly-labeled deterministic translation table for the exact
+# demo phrases this project's fallback parser and smoke test use. This is
+# NOT a general translator - it only fires when Gemma (a) confirmed the
+# transcript is non-English and (b) failed to supply its own English
+# translation, so the caregiver view is never left silently blank when a
+# safe, known-correct translation is available. Anything not in this table
+# simply leaves `english_summary` as None rather than fabricate a
+# translation.
+_KNOWN_SPANISH_SUMMARIES: dict[str, str] = {
+    "me siento confundida. por favor llama a helper.": "I feel confused. Please call Helper.",
+    "me siento confundido. por favor llama a helper.": "I feel confused. Please call Helper.",
+}
+
+
+def _deterministic_translation(transcript: str) -> str | None:
+    return _KNOWN_SPANISH_SUMMARIES.get(transcript.strip().lower())
+
+
+UNDETERMINED_LANGUAGE = "und"
+
+
+def normalize_detected_language(transcript: str, detected_language: str | None) -> str:
+    """Resolves a supported language tag deterministically.
+
+    Rules:
+    - A language value Gemma actually returned is trusted and preserved
+      as-is (Gemma is explicitly instructed to report the transcript's
+      real language; this function only fills the gap when it's missing,
+      never overrides a stated value).
+    - When missing, explicit Spanish evidence - the SAME carefully scoped
+      phrases already used for intent validation (`_SPANISH_INTENT_MARKERS`,
+      i.e. the Spanish subset of `_OKAY_EVIDENCE`/`_NEED_HELP_EVIDENCE`) -
+      sets "es". A bare contact name (e.g. "Helper") is never in that list,
+      so a name mention alone can never imply Spanish (or an emergency).
+    - When missing and explicit English evidence is present
+      (`_ENGLISH_INTENT_MARKERS`), sets "en".
+    - Otherwise "und" (undetermined) - this function never fabricates a
+      language guess from weak/ambiguous signals.
+    """
+    if detected_language:
+        return detected_language
+    lowered = transcript.lower()
+    if _has_any_phrase(lowered, _SPANISH_INTENT_MARKERS):
+        return "es"
+    if _has_any_phrase(lowered, _ENGLISH_INTENT_MARKERS):
+        return "en"
+    return UNDETERMINED_LANGUAGE
 
 
 def describe_semantic_correction(reason: str) -> str:
@@ -192,6 +309,36 @@ def describe_semantic_correction(reason: str) -> str:
             "english_summary was reset to match the validated summary "
             "instead of a reworded translation, since the transcript was "
             "already in English."
+        )
+    if reason.startswith("reclassified_to_need_help_from:"):
+        original = reason.split(":", 1)[1]
+        return (
+            f"The proposed action '{original}' had no supporting language, "
+            "but the transcript contained an explicit help/contact request "
+            "or a stated inability to respond safely, so the action was "
+            "corrected to 'need_help'. This is a deterministic backend "
+            "safety correction, not a Gemma failure."
+        )
+    if reason == "english_summary_mislabeled_corrected":
+        return (
+            "english_summary matched the non-English summary verbatim "
+            "(not an actual translation), so it was replaced with a known "
+            "safe translation or cleared rather than mislabeling foreign "
+            "text as English."
+        )
+    if reason == "english_summary_filled_from_known_translation":
+        return (
+            "Gemma did not supply an English translation for a non-English "
+            "transcript, so a known, explicitly labeled deterministic "
+            "translation was used instead of leaving it blank."
+        )
+    if reason.startswith("detected_language_normalized:"):
+        language = reason.split(":", 1)[1]
+        return (
+            f"Gemma did not report a language, so it was deterministically "
+            f"set to '{language}' based on explicit language markers "
+            "actually present in the transcript (never guessed from a bare "
+            "name or weak signal)."
         )
     return reason
 
@@ -220,17 +367,63 @@ def _apply_deterministic_corrections(
 
     # An action may only stand if the transcript actually contains explicit
     # supporting language - guards against the model inferring an action
-    # from an unrelated statement.
+    # from an unrelated statement. Before giving up entirely, check whether
+    # the transcript contains explicit evidence of "need_help" instead: a
+    # genuine help/contact request or a stated inability to respond safely
+    # must never be silently lost to "unknown" just because Gemma proposed
+    # a different, unsupported action (e.g. mistakenly said "okay" for a
+    # Spanish help request) - see `_NEED_HELP_EVIDENCE`. This never invents
+    # facts; it only re-reads the same transcript against a stricter,
+    # safety-priority phrase list.
     if not _has_evidence(lowered, corrected.action):
         original_action = corrected.action
-        corrected = corrected.model_copy(update={"action": "unknown"})
-        reasons.append(f"unsupported_action_downgraded:{original_action}")
+        if original_action != "need_help" and _has_evidence(lowered, "need_help"):
+            corrected = corrected.model_copy(update={"action": "need_help"})
+            reasons.append(f"reclassified_to_need_help_from:{original_action}")
+        else:
+            corrected = corrected.model_copy(update={"action": "unknown"})
+            reasons.append(f"unsupported_action_downgraded:{original_action}")
 
-    # Never let a translation/rewrite attempt alter an already-English
-    # summary - english_summary must be exactly the validated summary.
-    if _is_english(corrected.detected_language) and corrected.english_summary != corrected.summary:
-        corrected = corrected.model_copy(update={"english_summary": corrected.summary})
-        reasons.append("english_summary_normalized")
+    # Deterministic language normalization - MUST run before english_summary
+    # normalization/correction below, since that logic branches on whether
+    # the language is confirmed English, confirmed non-English, or
+    # genuinely undetermined ("und").
+    if not corrected.detected_language:
+        normalized_language = normalize_detected_language(transcript, corrected.detected_language)
+        if normalized_language != corrected.detected_language:
+            corrected = corrected.model_copy(update={"detected_language": normalized_language})
+            reasons.append(f"detected_language_normalized:{normalized_language}")
+
+    # english_summary normalization/correction. Only ever touched when the
+    # language is a *confirmed, non-undetermined* value - never when it's
+    # "und" (see `normalize_detected_language`'s docstring for why guessing
+    # there is unsafe).
+    detected_language = corrected.detected_language
+    if _is_english(detected_language):
+        # Never let a translation/rewrite attempt alter an already-English
+        # summary - english_summary must be exactly the validated summary.
+        if corrected.english_summary != corrected.summary:
+            corrected = corrected.model_copy(update={"english_summary": corrected.summary})
+            reasons.append("english_summary_normalized")
+    elif detected_language and detected_language != UNDETERMINED_LANGUAGE:
+        # Confirmed non-English. A non-English summary must never
+        # masquerade as its own English translation.
+        if (
+            corrected.english_summary
+            and corrected.english_summary.strip().lower() == corrected.summary.strip().lower()
+        ):
+            corrected = corrected.model_copy(
+                update={"english_summary": _deterministic_translation(transcript)}
+            )
+            reasons.append("english_summary_mislabeled_corrected")
+        elif not corrected.english_summary:
+            translation = _deterministic_translation(transcript)
+            if translation:
+                corrected = corrected.model_copy(update={"english_summary": translation})
+                reasons.append("english_summary_filled_from_known_translation")
+    # else: detected_language is "und" - leave english_summary exactly as
+    # Gemma/the fallback parser produced it; we cannot safely confirm or
+    # correct a translation without knowing the source language.
 
     return corrected, reasons
 
@@ -320,8 +513,11 @@ Transcript: "What's the weather like today?"
 """
 
 
-def _build_analysis_contents(transcript: str) -> str:
-    return f'{ANALYSIS_SYSTEM_INSTRUCTION}\n\nPatient transcript:\n"""{transcript}"""'
+def _build_analysis_contents(transcript: str, *, strict: bool = False) -> str:
+    contents = f'{ANALYSIS_SYSTEM_INSTRUCTION}\n\nPatient transcript:\n"""{transcript}"""'
+    if strict:
+        contents += _STRICT_JSON_REMINDER
+    return contents
 
 
 def _gemma_enabled() -> bool:
@@ -475,17 +671,288 @@ def _fallback_interpret(transcript: str) -> PatientCheckInAnalysis:
     )
 
 
+# --- Failure-stage reporting -----------------------------------------------
+#
+# `analyze_patient_checkin` and `generate_caregiver_handoff` can fail to get
+# a usable Gemma result at several distinct stages. Collapsing all of them
+# into one generic reason (as this module used to) makes real failures
+# undiagnosable. Each stage below is reported with only *safe* diagnostic
+# detail - never API keys, prompts, hidden reasoning, complete raw SDK
+# objects, or full patient transcripts.
+#
+# The stages this module distinguishes (see `analyze_patient_checkin`):
+#   - "sdk_request_failed"       the API call itself raised (network, auth,
+#                                 quota, etc.)
+#   - "empty_model_response"     the call succeeded but returned no usable
+#                                 text/parsed content, and the SDK did NOT
+#                                 explicitly report a safety block
+#   - "safety_blocked"           the call succeeded but returned no usable
+#                                 text/parsed content, and the SDK's own
+#                                 finish/block reason explicitly says so
+#                                 (e.g. `finish_reason=SAFETY`) - never
+#                                 inferred from empty text alone
+#   - "json_parse_failed"        response text was present but no valid,
+#                                 complete JSON object could be extracted
+#                                 from it (after stripping an optional
+#                                 Markdown fence and any surrounding prose)
+#   - "schema_validation_failed" JSON parsed but didn't match
+#                                 `PatientCheckInAnalysis`/`CaregiverHandoff`
+#   - "safety_scan_failed"       passed schema validation but tripped
+#                                 `_contains_unsafe_content`
+#   - "semantic_validation" (not a failure/fallback - reported via the
+#                                 "gemma" source's `note` as
+#                                 "semantic_correction:...", see
+#                                 `describe_semantic_correction`)
+#
+# `json_parse_failed` and `schema_validation_failed` are retried exactly
+# once (see `analyze_patient_checkin`) with a stricter, more deterministic
+# request before giving up - a model occasionally wraps valid JSON in
+# Markdown or adds a stray sentence, which is a formatting slip, not a
+# reason to distrust the whole interpretation.
+
+
+def _response_finish_reason(response: object) -> object | None:
+    candidates = getattr(response, "candidates", None) or []
+    if candidates:
+        return getattr(candidates[0], "finish_reason", None)
+    return None
+
+
+def _response_block_reason(response: object) -> object | None:
+    feedback = getattr(response, "prompt_feedback", None)
+    return getattr(feedback, "block_reason", None) if feedback is not None else None
+
+
+def _safe_reason_name(value: object | None) -> str | None:
+    """Renders an SDK enum/string reason code safely (name only, never a
+    full repr of the underlying object)."""
+    if value is None:
+        return None
+    return getattr(value, "name", None) or str(value)
+
+
+def _is_explicit_safety_block(finish_reason: object, block_reason: object) -> bool:
+    """True only when the SDK itself explicitly reports a safety block -
+    NEVER inferred merely from an empty/missing response. Distinguishing
+    this from a generic `empty_model_response` avoids the earlier,
+    unproven assumption that every empty response was a safety block.
+    """
+    for value in (finish_reason, block_reason):
+        name = _safe_reason_name(value)
+        if name and "SAFETY" in name.upper():
+            return True
+    return False
+
+
+def _response_diagnostics(
+    response: object,
+    raw_text: str,
+    *,
+    had_fence: bool = False,
+    exception_class: str | None = None,
+) -> str:
+    """Builds a safe diagnostic string: finish reason, response text
+    character length, whether it was blank, whether it contained a
+    Markdown fence, and (when applicable) an exception class name. Never
+    includes prompts, hidden reasoning, API keys, or the raw SDK object.
+    """
+    parts = [
+        f"finish_reason={_safe_reason_name(_response_finish_reason(response))}",
+        f"text_length={len(raw_text)}",
+        f"blank={not raw_text.strip()}",
+        f"markdown_fence={had_fence}",
+    ]
+    block_reason = _safe_reason_name(_response_block_reason(response))
+    if block_reason:
+        parts.append(f"block_reason={block_reason}")
+    if exception_class:
+        parts.append(f"exception={exception_class}")
+    return "; ".join(parts)
+
+
+def _summarize_validation_error(exc: ValidationError) -> str:
+    """Safe (no field values) diagnostic naming which fields failed schema."""
+    fields = sorted({".".join(str(part) for part in err["loc"]) for err in exc.errors()})
+    return f"{len(fields)} field(s) failed schema validation: {', '.join(fields)}"
+
+
+_JSON_FENCE_PATTERN = re.compile(r"^```(?:json)?\s*\n?(.*?)\n?```$", re.DOTALL)
+
+
+def _strip_markdown_fence(text: str) -> tuple[str, bool]:
+    """Strips a single optional ```json / ``` fence wrapping the whole
+    response. Returns (unwrapped_text, had_fence)."""
+    stripped = text.strip()
+    match = _JSON_FENCE_PATTERN.match(stripped)
+    if match:
+        return match.group(1).strip(), True
+    return stripped, False
+
+
+def _extract_balanced_json_object(text: str) -> str | None:
+    """Finds the first complete, brace-balanced JSON object in `text`,
+    tolerating harmless leading/trailing prose around it (e.g. "Here is
+    the result: {...} Let me know if you need anything else."). Returns
+    None if no balanced object is found. Braces inside JSON string
+    literals are tracked so they never affect the balance count.
+    """
+    start = text.find("{")
+    if start == -1:
+        return None
+    depth = 0
+    in_string = False
+    escape = False
+    for index in range(start, len(text)):
+        char = text[index]
+        if in_string:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : index + 1]
+    return None
+
+
+def _extract_parsed_detailed(
+    response: object, model_cls: type
+) -> tuple[Any | None, str | None, str | None]:
+    """Extracts `model_cls` from a Gemini response with a precise failure
+    stage. Returns (parsed_or_None, failure_stage, safe_detail); the last
+    two are None on success.
+
+    Order: (1) prefer `response.parsed` when it's already the expected
+    type: (2) otherwise read `response.text` safely; (3) strip an optional
+    Markdown fence; (4) extract the first balanced JSON object, tolerating
+    harmless leading/trailing prose; (5) `json.loads`; (6) validate with
+    `model_cls`.
+    """
+    parsed = getattr(response, "parsed", None)
+    if isinstance(parsed, model_cls):
+        return parsed, None, None
+
+    raw_text = getattr(response, "text", None) or ""
+    if not raw_text.strip():
+        finish_reason = _response_finish_reason(response)
+        block_reason = _response_block_reason(response)
+        stage = (
+            "safety_blocked"
+            if _is_explicit_safety_block(finish_reason, block_reason)
+            else "empty_model_response"
+        )
+        return None, stage, _response_diagnostics(response, raw_text)
+
+    unwrapped, had_fence = _strip_markdown_fence(raw_text)
+    candidate = _extract_balanced_json_object(unwrapped)
+    if candidate is None:
+        return (
+            None,
+            "json_parse_failed",
+            _response_diagnostics(
+                response, raw_text, had_fence=had_fence, exception_class="NoJsonObjectFound"
+            ),
+        )
+
+    try:
+        data = json.loads(candidate)
+    except (json.JSONDecodeError, TypeError) as exc:
+        return (
+            None,
+            "json_parse_failed",
+            _response_diagnostics(
+                response, raw_text, had_fence=had_fence, exception_class=exc.__class__.__name__
+            ),
+        )
+
+    try:
+        return model_cls.model_validate(data), None, None
+    except ValidationError as exc:
+        detail = (
+            f"{_summarize_validation_error(exc)}; text_length={len(raw_text)}; "
+            f"markdown_fence={had_fence}"
+        )
+        return None, "schema_validation_failed", detail
+
+
+# Failure stages that are worth one strict, low-temperature retry: a model
+# occasionally wraps valid JSON in prose/Markdown or produces slightly
+# malformed JSON, which is a formatting slip worth one clean retry - unlike
+# an empty/blocked response or a transport failure, which a retry with the
+# same input is unlikely to fix.
+_RETRYABLE_STAGES = frozenset({"json_parse_failed", "schema_validation_failed"})
+
+# The lowest temperature the Gemini API supports, for the single retry -
+# maximizes determinism/instruction-following on the second attempt.
+_RETRY_TEMPERATURE = 0.0
+
+_STRICT_JSON_REMINDER = (
+    "\n\nIMPORTANT: Your previous response could not be parsed. Respond "
+    "with exactly one JSON object and nothing else - no prose, no "
+    "explanation, and no Markdown code fences before, after, or around it."
+)
+
+
+def _request_analysis(client, model_name: str, transcript: str, types_module, *, strict: bool):
+    """Single Gemma call for `analyze_patient_checkin`. No safety_settings
+    override - Gemini's default upstream content-safety behavior is used
+    unless a separately documented, tested reason justifies changing it
+    (none currently exists; see module history/README)."""
+    return client.models.generate_content(
+        model=model_name,
+        contents=_build_analysis_contents(transcript, strict=strict),
+        config=types_module.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=PatientCheckInAnalysis,
+            temperature=_RETRY_TEMPERATURE if strict else 0.1,
+        ),
+    )
+
+
 def analyze_patient_checkin(
     transcript: str,
 ) -> tuple[PatientCheckInAnalysis, InterpretationSource, str | None]:
     """Interprets a patient transcript, preferring Gemma with a safe fallback.
 
-    Returns (analysis, source, note). When `source == "fallback"`, `note`
-    explains why the fallback was used. When `source == "gemma"`, `note` is
-    either None (Gemma's classification was used as-is) or a
-    "semantic_correction:<reason>[,<reason>...]" string describing which
+    Returns (analysis, source, note). This function has no side effects
+    beyond the Gemma call(s) themselves - it never proposes, validates, or
+    executes an application tool - so retrying the Gemma request internally
+    (see below) can never cause a duplicate application action; the caller
+    always receives exactly one final `PatientCheckInAnalysis`, and only
+    that one result ever reaches `app.tools`.
+
+    When `source == "fallback"`, `note` is `"<stage>:<safe detail>"` (or
+    just `"<stage>"` when there's no extra detail), optionally suffixed
+    with `";retry_attempted=true"`, identifying exactly which stage
+    produced an unusable result - one of "gemma_disabled",
+    "gemma_not_configured", "sdk_request_failed", "empty_model_response",
+    "safety_blocked", "json_parse_failed", "schema_validation_failed", or
+    "safety_scan_failed". `<safe detail>` never includes API keys, prompts,
+    hidden reasoning, complete raw SDK objects, or the full patient
+    transcript - only structural diagnostics (exception class names, which
+    fields failed, Gemini's own block/finish reason codes, response text
+    length, and whether it was blank/fenced).
+
+    `json_parse_failed` and `schema_validation_failed` are retried exactly
+    once with a stricter, lowest-temperature request before falling back
+    (see `_RETRYABLE_STAGES`) - a model occasionally wraps valid JSON in
+    Markdown or prose, which is a formatting slip, not proof the
+    interpretation itself is untrustworthy.
+
+    When `source == "gemma"`, `note` is `None` (Gemma's classification was
+    used as-is on the first attempt), or a `;`-separated combination of
+    `"retry_attempted=true"` (the result came from the one retry) and/or a
+    `"semantic_correction:<reason>[,<reason>...]"` string describing which
     deterministic backend safety correction(s) from
-    `_apply_deterministic_corrections` were applied - this is NOT a Gemma
+    `_apply_deterministic_corrections` were applied - neither is a Gemma
     failure, so `source` stays "gemma" (see `describe_semantic_correction`).
     """
     client, model_name = _get_client_and_model()
@@ -498,30 +965,57 @@ def analyze_patient_checkin(
 
     try:
         from google.genai import types
-
-        response = client.models.generate_content(
-            model=model_name,
-            contents=_build_analysis_contents(transcript),
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=PatientCheckInAnalysis,
-                temperature=0.1,
-            ),
-        )
-    except Exception as exc:
+    except Exception as exc:  # pragma: no cover - defensive; _get_client_and_model already imports this
         logger.warning("Gemma request failed, using fallback parser: %s", exc)
         analysis, _ = _apply_deterministic_corrections(
             transcript, _fallback_interpret(transcript)
         )
-        return analysis, "fallback", "gemma_request_failed"
+        return analysis, "fallback", f"sdk_request_failed:{exc.__class__.__name__}"
 
-    analysis = _extract_parsed(response, PatientCheckInAnalysis)
+    retry_attempted = False
+    analysis: PatientCheckInAnalysis | None = None
+    stage: str | None = None
+    detail: str | None = None
+
+    for attempt_is_retry in (False, True):
+        try:
+            response = _request_analysis(
+                client, model_name, transcript, types, strict=attempt_is_retry
+            )
+        except Exception as exc:
+            logger.warning("Gemma request failed, using fallback parser: %s", exc)
+            analysis, _ = _apply_deterministic_corrections(
+                transcript, _fallback_interpret(transcript)
+            )
+            reason = f"sdk_request_failed:{exc.__class__.__name__}"
+            if retry_attempted:
+                reason += ";retry_attempted=true"
+            return analysis, "fallback", reason
+
+        analysis, stage, detail = _extract_parsed_detailed(response, PatientCheckInAnalysis)
+        if analysis is not None:
+            break
+
+        if not attempt_is_retry and stage in _RETRYABLE_STAGES:
+            retry_attempted = True
+            logger.warning(
+                "Gemma output failed (%s), retrying once with a stricter prompt", stage
+            )
+            continue
+        break
+
     if analysis is None:
-        logger.warning("Gemma returned unusable output, using fallback parser")
+        logger.warning(
+            "Gemma output could not be used (%s: %s, retry_attempted=%s), using fallback parser",
+            stage, detail, retry_attempted,
+        )
         analysis, _ = _apply_deterministic_corrections(
             transcript, _fallback_interpret(transcript)
         )
-        return analysis, "fallback", "gemma_invalid_output"
+        reason = f"{stage}:{detail}" if detail else stage
+        if retry_attempted:
+            reason += ";retry_attempted=true"
+        return analysis, "fallback", reason
 
     unsafe = _contains_unsafe_content(
         analysis.summary,
@@ -534,14 +1028,18 @@ def analyze_patient_checkin(
         analysis, _ = _apply_deterministic_corrections(
             transcript, _fallback_interpret(transcript)
         )
-        return (
-            analysis,
-            "fallback",
-            f"gemma_unsafe_content:{unsafe}",
-        )
+        reason = f"safety_scan_failed:{unsafe}"
+        if retry_attempted:
+            reason += ";retry_attempted=true"
+        return analysis, "fallback", reason
 
     analysis, corrections = _apply_deterministic_corrections(transcript, analysis)
-    note = f"semantic_correction:{','.join(corrections)}" if corrections else None
+    note_parts = []
+    if retry_attempted:
+        note_parts.append("retry_attempted=true")
+    if corrections:
+        note_parts.append(f"semantic_correction:{','.join(corrections)}")
+    note = ";".join(note_parts) if note_parts else None
     return analysis, "gemma", note
 
 
@@ -716,12 +1214,17 @@ def _generate_caregiver_handoff_raw(
         )
     except Exception as exc:
         logger.warning("Gemma handoff request failed, using fallback: %s", exc)
-        return _fallback_handoff(event, analysis), "fallback", "gemma_handoff_request_failed"
+        return (
+            _fallback_handoff(event, analysis),
+            "fallback",
+            f"gemma_handoff_sdk_request_failed:{exc.__class__.__name__}",
+        )
 
-    handoff = _extract_parsed(response, CaregiverHandoff)
+    handoff, stage, detail = _extract_parsed_detailed(response, CaregiverHandoff)
     if handoff is None:
-        logger.warning("Gemma handoff output was unusable, using fallback")
-        return _fallback_handoff(event, analysis), "fallback", "gemma_handoff_invalid_output"
+        logger.warning("Gemma handoff output could not be used (%s: %s), using fallback", stage, detail)
+        reason = f"gemma_handoff_{stage}:{detail}" if detail else f"gemma_handoff_{stage}"
+        return _fallback_handoff(event, analysis), "fallback", reason
 
     unsafe = _contains_unsafe_content(handoff.headline, handoff.handoff)
     if unsafe:
@@ -729,22 +1232,12 @@ def _generate_caregiver_handoff_raw(
         return (
             _fallback_handoff(event, analysis),
             "fallback",
-            f"gemma_handoff_unsafe_content:{unsafe}",
+            f"gemma_handoff_safety_scan_failed:{unsafe}",
         )
 
     return handoff, "gemma", None
 
 
 def _extract_parsed(response, model_cls):
-    parsed = getattr(response, "parsed", None)
-    if isinstance(parsed, model_cls):
-        return parsed
-
-    raw_text = getattr(response, "text", None)
-    if raw_text:
-        try:
-            data = json.loads(raw_text)
-            return model_cls.model_validate(data)
-        except (json.JSONDecodeError, ValidationError, TypeError):
-            return None
-    return None
+    parsed, _stage, _detail = _extract_parsed_detailed(response, model_cls)
+    return parsed

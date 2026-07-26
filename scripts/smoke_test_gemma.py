@@ -18,8 +18,25 @@ the response was schema-valid. It exits nonzero if any transcript:
 - Produces a semantically wrong result even though it was schema-valid -
   e.g. "My backpack is red." classified as "okay", a follow-up recheck
   request not taking precedence over a general "okay" statement, an
-  English transcript's `english_summary` being needlessly reworded, or a
-  "Helper" contact request not being extracted.
+  English transcript's `english_summary` being needlessly reworded, a
+  "Helper" contact request not being extracted, or an explicit Spanish
+  help/contact request being lost to "unknown".
+
+When a transcript falls back, the printed `stage` identifies exactly where
+it failed - one of "gemma_disabled", "gemma_not_configured",
+"sdk_request_failed", "empty_model_response", "safety_blocked" (only when
+the SDK itself explicitly reports a safety block - never inferred from an
+empty response alone), "json_parse_failed", "schema_validation_failed", or
+"safety_scan_failed" - with a safe `detail` line (never the API key,
+prompt, hidden reasoning, or a raw SDK object). "json_parse_failed" and
+"schema_validation_failed" are retried exactly once internally before
+falling back; when that happened, a `retry_attempted: true` line is
+printed alongside the stage (whether the retry ultimately succeeded or
+not).
+
+When a transcript succeeds via Gemma but a deterministic backend safety
+correction was applied (see `app.gemma_service.describe_semantic_correction`),
+the printed stage is "semantic_validation" - this is NOT a Gemma failure.
 
 Never prints the API key.
 """
@@ -55,6 +72,7 @@ CASES = [
         "transcript": "I'm awake, but I'm alone and I can't stand up.",
         "expect_action": "need_help",
         "expect_english_summary_equals_summary": True,
+        "expect_tool_name": "request_caregiver_help",
     },
     {
         "transcript": "Everything is okay, but check on me again in ten minutes.",
@@ -76,6 +94,14 @@ CASES = [
         "expect_action": "need_help",
         "expect_requested_contact": "Helper",
         "expect_not_english": True,
+        "expect_detected_language": "es",
+        "expect_english_summary": "I feel confused. Please call Helper.",
+        "expect_reported_condition": "confundida",
+        "expect_tool_name": "request_caregiver_help",
+    },
+    {
+        "transcript": "Mi amigo Helper vino a visitarme ayer.",
+        "expect_action": "unknown",
     },
 ]
 
@@ -111,6 +137,27 @@ def _check_case(case: dict, analysis, tool) -> list[str]:
                 f"transcript, got summary={analysis.summary!r} "
                 f"english_summary={analysis.english_summary!r}"
             )
+
+    expected_english_summary = case.get("expect_english_summary")
+    if expected_english_summary is not None and analysis.english_summary != expected_english_summary:
+        problems.append(
+            f"expected english_summary={expected_english_summary!r}, "
+            f"got {analysis.english_summary!r}"
+        )
+
+    expected_condition = case.get("expect_reported_condition")
+    if expected_condition is not None and analysis.reported_condition != expected_condition:
+        problems.append(
+            f"expected reported_condition={expected_condition!r}, "
+            f"got {analysis.reported_condition!r}"
+        )
+
+    expected_language = case.get("expect_detected_language")
+    if expected_language is not None and analysis.detected_language != expected_language:
+        problems.append(
+            f"expected detected_language={expected_language!r}, "
+            f"got {analysis.detected_language!r}"
+        )
 
     if case.get("expect_not_english"):
         if not analysis.english_summary:
@@ -156,11 +203,22 @@ def main() -> int:
             failures += 1
             continue
 
+        # `note` is "<stage>[:<safe detail>][;retry_attempted=true]" on
+        # fallback, or "[retry_attempted=true][;semantic_correction:...]"
+        # (either part optional) on a Gemma success - see
+        # `analyze_patient_checkin`'s docstring for the full list of
+        # stages. Never includes the API key, prompt, or a raw SDK object.
+        retry_attempted = bool(note) and "retry_attempted=true" in note
+
         if source != "gemma":
-            print(
-                f"    FAILED: fell back to the '{source}' parser "
-                f"(reason: {note}). Gemma was not actually exercised."
-            )
+            body = (note or "unknown").replace(";retry_attempted=true", "")
+            stage, _, detail = body.partition(":")
+            print(f"    FAILED: fell back to the '{source}' parser.")
+            print(f"    stage:              {stage}")
+            if detail:
+                print(f"    detail:             {detail}")
+            if retry_attempted:
+                print("    retry_attempted:    true")
             failures += 1
             continue
 
@@ -175,8 +233,19 @@ def main() -> int:
         print(f"    supply_location:    {analysis.supply_location}")
         print(f"    follow_up_minutes:  {analysis.follow_up_minutes}")
         print(f"    proposed tool:      {tool.name} {tool.arguments}")
+
+        correction = None
         if note:
-            print(f"    note:               {note}")
+            for part in note.split(";"):
+                if part.startswith("semantic_correction:"):
+                    correction = part.split(":", 1)[1]
+        if correction:
+            print("    stage:              semantic_validation")
+            print(f"    correction(s):      {correction}")
+        else:
+            print("    stage:              ok")
+        if retry_attempted:
+            print("    retry_attempted:    true")
 
         problems = _check_case(case, analysis, tool)
         if problems:

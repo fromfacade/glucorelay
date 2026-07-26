@@ -21,6 +21,7 @@ follow - that schema constraint is the "equivalent constrained tool
 selection" mechanism in place of native tool calling.
 """
 
+import re
 from datetime import datetime, timezone
 from typing import Any
 
@@ -85,6 +86,14 @@ def _analysis_field_for_argument(tool_name: str, argument_key: str) -> str:
 # Defense-in-depth: even though tool arguments are drawn from a small
 # allow-list of factual fields, scan any string argument for language that
 # would indicate a treatment/medication recommendation slipped through.
+#
+# SCOPE: these entries target generated MEDICAL INSTRUCTIONS (a treatment
+# command, a dosage, an insulin recommendation) - never a patient-reported
+# physical condition. Phrases like "can't stand", "unable to move", or
+# "alone" must NEVER be added here - they are exactly the kind of explicit
+# symptom `need_help` exists to capture. Matched on word boundaries (see
+# `_scan_for_treatment_language`) so an entry can never fire on part of an
+# unrelated word.
 _TREATMENT_DENYLIST = (
     "insulin",
     "dose",
@@ -96,6 +105,10 @@ _TREATMENT_DENYLIST = (
     "medication",
     "inject",
     "administer",
+)
+
+_TREATMENT_DENYLIST_PATTERN = re.compile(
+    r"\b(?:" + "|".join(re.escape(p) for p in _TREATMENT_DENYLIST) + r")\w*\b"
 )
 
 
@@ -117,10 +130,9 @@ def propose_tool(analysis: PatientCheckInAnalysis) -> ProposedToolCall:
 def _scan_for_treatment_language(arguments: dict[str, Any]) -> str | None:
     for value in arguments.values():
         if isinstance(value, str):
-            lowered = value.lower()
-            for banned in _TREATMENT_DENYLIST:
-                if banned in lowered:
-                    return banned
+            match = _TREATMENT_DENYLIST_PATTERN.search(value.lower())
+            if match:
+                return match.group(0)
     return None
 
 
