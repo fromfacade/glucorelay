@@ -1,316 +1,54 @@
 <!doctype html>
 <html lang="en">
-<<<<<<< HEAD
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <meta name="theme-color" content="#0f172a" />
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#07111f">
   <title>GlucoRelay Caregiver</title>
-  <link rel="stylesheet" href="/static/styles.css" />
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js" defer></script>
+  <link rel="stylesheet" href="/static/styles.css">
   <script src="/static/app.js" defer></script>
 </head>
 <body data-page="caregiver">
   <header class="topbar">
-    <div>
-      <p class="eyebrow">Caregiver console</p>
-      <h1>GlucoRelay</h1>
-    </div>
-    <nav class="topnav" aria-label="Primary navigation">
-      <a class="nav-link" href="/">Patient demo</a>
-      <a class="nav-link active" href="/static/caregiver.html">Caregiver view</a>
-    </nav>
+    <a class="brand" href="/"><span class="brand-mark">G</span><span><strong>GlucoRelay</strong><small>Caregiver console</small></span></a>
+    <nav class="top-actions"><span id="connectionPill" class="pill pill-neutral">Connecting</span>
+      <button id="audioToggleBtn" class="button button-ghost audio-toggle" type="button" aria-pressed="true">Audio on</button><a class="button button-ghost" href="/">Patient view</a></nav>
   </header>
-
   <main class="shell caregiver-shell">
-    <section id="caregiverHero" class="caregiver-hero calm">
+    <section class="demo-notice"><strong>Demo caregiver console.</strong> Updates automatically from the patient dashboard.</section>
+    <section id="caregiverHero" class="card caregiver-hero state-neutral">
       <div>
-        <p class="eyebrow">Live event monitoring</p>
-        <h2 id="caregiverHeadline">No active emergency</h2>
-        <p id="caregiverSubhead">This page checks for updates automatically.</p>
+        <p class="eyebrow">Live emergency status</p>
+        <h1 id="caregiverTitle">No active emergency</h1>
+        <p id="caregiverReason" class="muted">Waiting for an event from the patient dashboard.</p>
       </div>
-      <span id="caregiverStatus" class="status-pill neutral">Standing by</span>
+      <div class="caregiver-reading"><span id="caregiverReading">--</span><small>mg/dL</small><span id="caregiverTrend">No trend</span></div>
     </section>
-
     <section class="caregiver-grid">
       <article class="card">
-        <div class="card-header">
-          <div>
-            <p class="eyebrow">Patient status</p>
-            <h2>Latest reading</h2>
-          </div>
+        <div class="card-heading"><div><p class="eyebrow">Response</p><h2>Caregiver actions</h2></div><span id="caregiverStatus" class="status-badge">Idle</span></div>
+        <label class="field"><span>Your name</span><input id="caregiverName" maxlength="80" value="Luis" autocomplete="name"></label>
+        <div class="action-grid">
+          <button id="acknowledgeBtn" class="button button-primary" disabled>Acknowledge alert</button>
+          <button id="caregiverResolveBtn" class="button button-success" disabled>Mark resolved</button>
         </div>
-        <div class="reading-main compact">
-          <div>
-            <div class="reading-value-row">
-              <span id="caregiverReading" class="reading-value">--</span>
-              <span class="reading-unit">mg/dL</span>
-            </div>
-            <p id="caregiverReadingMeta" class="muted">No reading available</p>
-          </div>
-          <div id="caregiverTrend" class="trend-icon">?</div>
-        </div>
+        <p id="acknowledgedText" class="helper">No caregiver acknowledgement yet.</p>
       </article>
-
       <article class="card">
-        <div class="card-header">
-          <div>
-            <p class="eyebrow">Response</p>
-            <h2>Caregiver action</h2>
-          </div>
-        </div>
-        <div id="caregiverActionEmpty" class="empty-state compact-empty">
-          <p>No acknowledgement is needed.</p>
-        </div>
-        <form id="ackForm" class="form-stack hidden">
-          <label>
-            Your name
-            <input id="caregiverName" type="text" minlength="1" maxlength="80" placeholder="Caregiver name" required />
-          </label>
-          <button id="ackButton" class="button danger" type="submit">Acknowledge and respond</button>
-        </form>
-        <button id="caregiverResolveButton" class="button success full hidden" type="button">Mark event resolved</button>
-      </article>
-    </section>
-
-    <section class="content-grid">
-      <article class="card chart-card">
-        <div class="card-header">
-          <div>
-            <p class="eyebrow">Observed this session</p>
-            <h2>Glucose trend</h2>
-          </div>
-        </div>
-        <div class="chart-wrap">
-          <canvas id="caregiverChart" aria-label="Caregiver glucose chart"></canvas>
-        </div>
-      </article>
-
-      <article class="card">
-        <div class="card-header">
-          <div>
-            <p class="eyebrow">Event details</p>
-            <h2>Coordination log</h2>
-          </div>
-        </div>
+        <div class="card-heading"><div><p class="eyebrow">Timeline</p><h2>Current event</h2></div></div>
         <dl class="detail-list">
-          <div><dt>Event ID</dt><dd id="detailEventId">—</dd></div>
-          <div><dt>Status</dt><dd id="detailStatus">—</dd></div>
-          <div><dt>Reason</dt><dd id="detailReason">—</dd></div>
-          <div><dt>Patient response</dt><dd id="detailPatientResponse">—</dd></div>
-          <div><dt>Acknowledged by</dt><dd id="detailAck">—</dd></div>
-          <div><dt>Last updated</dt><dd id="detailUpdated">—</dd></div>
+          <div><dt>Opened</dt><dd id="openedAt">--</dd></div>
+          <div><dt>Last update</dt><dd id="updatedAt">--</dd></div>
+          <div><dt>Patient response</dt><dd id="patientResponse">--</dd></div>
+          <div><dt>Event ID</dt><dd id="caregiverEventId">--</dd></div>
         </dl>
       </article>
     </section>
+    <section class="card">
+      <div class="card-heading"><div><p class="eyebrow">Resolved alerts</p><h2>Event history</h2></div></div>
+      <div id="historyList" class="history-list"><p class="muted">No resolved events yet.</p></div>
+    </section>
   </main>
-
   <div id="toastRegion" class="toast-region" aria-live="polite" aria-atomic="true"></div>
 </body>
-=======
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>GlucoRelay Caregiver Alert</title>
-    <style>
-      :root {
-        font-family: Inter, system-ui, sans-serif;
-        color-scheme: dark;
-        background: #101114;
-        color: #f6f7fb;
-      }
-      * {
-        box-sizing: border-box;
-      }
-      body {
-        margin: 0;
-        padding: 24px;
-      }
-      main {
-        width: min(640px, 100%);
-        margin: auto;
-      }
-      .card {
-        background: #1a1c22;
-        border: 1px solid #343844;
-        border-radius: 16px;
-        padding: 20px;
-        margin-bottom: 16px;
-      }
-      .status {
-        font-weight: 700;
-        text-transform: uppercase;
-        letter-spacing: 0.06em;
-        color: #ff9f6e;
-      }
-      .muted {
-        color: #b6bbc8;
-      }
-      dl {
-        display: grid;
-        grid-template-columns: max-content 1fr;
-        gap: 6px 14px;
-        margin: 0;
-      }
-      dt {
-        color: #8a8f9c;
-      }
-      dd {
-        margin: 0;
-      }
-      button {
-        min-height: 44px;
-        border: 0;
-        border-radius: 10px;
-        padding: 10px 16px;
-        font-weight: 700;
-        cursor: pointer;
-        background: #6fd6a2;
-        color: #04180d;
-        width: 100%;
-      }
-      button:disabled {
-        opacity: 0.45;
-        cursor: not-allowed;
-      }
-      a {
-        color: #7da2ff;
-      }
-      ul {
-        padding-left: 18px;
-        max-height: 260px;
-        overflow: auto;
-      }
-      .warning {
-        border-left: 4px solid #f2be55;
-        padding-left: 12px;
-      }
-    </style>
-  </head>
-  <body>
-    <main>
-      <h1>GlucoRelay Caregiver Alert</h1>
-      <p class="warning">
-        Hackathon simulation only. Not a real emergency notification system.
-      </p>
-
-      <section class="card">
-        <div id="status" class="status">Loading...</div>
-        <p id="reason" class="muted"></p>
-        <h2 id="handoffHeadline"></h2>
-        <p id="handoffText"></p>
-        <dl id="details"></dl>
-        <p id="mapsLink"></p>
-      </section>
-
-      <section class="card">
-        <button id="ackBtn" onclick="acknowledge()" disabled>
-          I'm responding
-        </button>
-        <p id="ackMessage" class="muted"></p>
-      </section>
-
-      <section class="card">
-        <h2>Incident timeline</h2>
-        <ul id="timeline"></ul>
-      </section>
-    </main>
-
-    <script>
-      const publicToken = window.location.pathname.split("/").pop();
-
-      async function loadEvent() {
-        const response = await fetch(`/api/caregiver/events/${publicToken}`);
-        if (!response.ok) {
-          document.getElementById("status").textContent = "Not found";
-          document.getElementById("reason").textContent =
-            "This caregiver link is invalid or has expired.";
-          document.getElementById("ackBtn").disabled = true;
-          return null;
-        }
-        return response.json();
-      }
-
-      function render(event) {
-        document.getElementById("status").textContent = event.status;
-        document.getElementById("reason").textContent = event.reason;
-        document.getElementById("handoffHeadline").textContent =
-          event.caregiver_handoff_headline || "";
-        document.getElementById("handoffText").textContent =
-          event.caregiver_handoff || "";
-
-        const details = document.getElementById("details");
-        details.innerHTML = "";
-        const rows = [
-          ["Reading", `${event.latest_reading.value_mg_dl} mg/dL (${event.latest_reading.trend})`],
-          ["Patient response", event.patient_response_summary || "No response yet"],
-          ["Requested contact", event.requested_contact || "-"],
-          ["Reported condition", event.reported_condition || "-"],
-          ["Reported action", event.reported_action || "-"],
-          ["Supply location", event.supply_location || "-"],
-          ["Acknowledged by", event.acknowledged_by || "-"],
-        ];
-        for (const [label, value] of rows) {
-          const dt = document.createElement("dt");
-          dt.textContent = label;
-          const dd = document.createElement("dd");
-          dd.textContent = value;
-          details.append(dt, dd);
-        }
-
-        const mapsLink = document.getElementById("mapsLink");
-        mapsLink.innerHTML = event.maps_url
-          ? `<a href="${event.maps_url}" target="_blank" rel="noopener">Open patient location in Maps</a>`
-          : "";
-
-        const ackBtn = document.getElementById("ackBtn");
-        const ackMessage = document.getElementById("ackMessage");
-        if (event.status === "contacting") {
-          ackBtn.disabled = false;
-          ackMessage.textContent = "";
-        } else if (event.status === "acknowledged") {
-          ackBtn.disabled = true;
-          ackMessage.textContent = `Acknowledged by ${event.acknowledged_by || "a caregiver"}.`;
-        } else {
-          ackBtn.disabled = true;
-          ackMessage.textContent = "No acknowledgement needed right now.";
-        }
-
-        const timeline = document.getElementById("timeline");
-        timeline.innerHTML = "";
-        for (const entry of event.timeline) {
-          const li = document.createElement("li");
-          li.textContent = `${new Date(entry.created_at).toLocaleTimeString()} - ${entry.message}`;
-          timeline.append(li);
-        }
-      }
-
-      async function refresh() {
-        const event = await loadEvent();
-        if (event) render(event);
-      }
-
-      async function acknowledge() {
-        const name = window.prompt("Your name?", "Helper") || "Helper";
-        const response = await fetch(
-          `/api/caregiver/events/${publicToken}/acknowledge`,
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ caregiver_name: name }),
-          },
-        );
-        const data = await response.json();
-        if (response.ok) {
-          render(data);
-        } else {
-          alert(data.detail?.message || data.detail || "Could not acknowledge.");
-        }
-      }
-
-      refresh();
-      setInterval(refresh, 5000);
-    </script>
-  </body>
->>>>>>> 6f25da51e256aadf3aa5506bf5293045763df70f
 </html>

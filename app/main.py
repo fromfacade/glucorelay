@@ -92,7 +92,6 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(
     request, exc: RequestValidationError
@@ -108,6 +107,11 @@ thresholds = DemoThresholds(
     urgent_low=int(os.getenv("DEMO_URGENT_LOW_THRESHOLD", "55")),
     high=int(os.getenv("DEMO_HIGH_THRESHOLD", "250")),
 )
+
+# Add frontend
+@app.get("/caregiver", include_in_schema=False)
+def caregiver() -> FileResponse:
+    return FileResponse(STATIC_DIR / "caregiver.html")
 
 
 def utc_now() -> datetime:
