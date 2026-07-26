@@ -85,7 +85,13 @@ Concretely, the safety boundary is enforced at five independent layers:
    banned language (e.g. "unconscious", "insulin", "dosage", "medication")
    before it's trusted; a hit discards the Gemma output entirely and falls
    back to the deterministic parser/handoff (`_contains_unsafe_content` in
-   `app/gemma_service.py`).
+   `app/gemma_service.py`). This scan is deliberately scoped to *generated
+   medical instructions* (a treatment command, a dosage, a diagnosis) and
+   matched on whole-word boundaries, so it can never fire on a *patient-
+   reported* physical limitation - phrases like "can't stand up", "unable
+   to stand", or "can't move" are explicitly never on this list (they are
+   exactly what `need_help` exists to capture) and are pinned by a
+   regression test (`tests/test_semantic_validation.py::test_safety_denylist_does_not_reject_reported_physical_limitations`).
 4. **`app/tools.py::validate_tool_call`** - the last line of defense before
    anything executes. It independently re-checks that the tool name is
    supported, the event's current status allows it, every argument matches
@@ -117,30 +123,138 @@ re-scan does not mean the classification is actually supported by what the
 patient said, so `app/gemma_service.py::_apply_deterministic_corrections`
 runs on **every** interpretation (Gemma or fallback) before it is trusted:
 
-- **Action-evidence check.** Each action (`okay`, `treating`, `false_alarm`,
-  `need_help`, `schedule_recheck`) has a fixed list of explicit English/
-  Spanish phrases (e.g. "i'm okay", "estoy bien", "drank juice", "false
-  alarm", "need help", "llama", "check on me again") that must actually
-  appear in the original transcript. If the claimed action has no such
-  phrase, it is deterministically downgraded to `"unknown"` - the event is
-  **not** transitioned. This is recorded as a `semantic_correction_applied`
-  step on both the timeline and the Gemma trace, explicitly **not** as a
-  Gemma failure (`interpretation_source` stays `"gemma"`) - it's a backend
-  safety correction, the same way a spell-checker underlining a word isn't
-  "the writer failing."
+- **Action-evidence check, with a need_help safety rescue.** Each action
+  (`okay`, `treating`, `false_alarm`, `need_help`, `schedule_recheck`) has a
+  fixed list of explicit English/Spanish phrases (e.g. "i'm okay", "estoy
+  bien", "drank juice", "false alarm", "need help", "llama a", "por favor
+  contacta a", "no puedo levantarme", "check on me again") that must
+  actually appear in the original transcript. If the claimed action has no
+  such phrase, the transcript is checked once more against the `need_help`
+  phrase list specifically - a genuine help/contact request or a stated
+  inability to respond safely must never be silently lost to `"unknown"`
+  just because Gemma proposed a different, unsupported action (this is
+  exactly what happened for "Me siento confundida. Por favor llama a
+  Helper.", which Gemma misclassified as `"okay"`; the deterministic layer
+  now reclassifies it to `need_help` instead of merely discarding the
+  result). Only if there's no `need_help` evidence either does the action
+  fall back to `"unknown"`. Either outcome is recorded as a
+  `semantic_correction_applied` step on both the timeline and the Gemma
+  trace, explicitly **not** as a Gemma failure (`interpretation_source`
+  stays `"gemma"`) - it's a backend safety correction, the same way a
+  spell-checker underlining a word isn't "the writer failing."
 - **Recheck-request precedence.** "Everything is okay, but check on me
   again in ten minutes." must produce `schedule_recheck`, not `okay` - an
   explicit, evidenced follow-up request always takes precedence over a
   general wellness statement when both are present.
-- **English summary normalization.** When `detected_language` is English,
-  `english_summary` is deterministically set equal to the already-validated
-  `summary` - Gemma's prompt asks it not to reword an English summary, but
-  the backend enforces this directly rather than trusting that instruction
-  alone. Non-English transcripts are unaffected and still receive a real
-  translated `english_summary`.
+- **English summary normalization.** `english_summary` is only ever
+  touched when `detected_language` resolves to a *confirmed* value - never
+  when it's undetermined (`"und"`), since guessing there previously caused
+  transcripts of unknown language to have their own source-language
+  `summary` mislabeled as an English translation. When the language is
+  confirmed English, `english_summary` is deterministically set equal to
+  the already-validated `summary` (Gemma's prompt asks it not to reword an
+  English summary, but the backend enforces this directly). When the
+  language is confirmed non-English and `english_summary` is missing or is
+  just the non-English `summary` echoed back verbatim (i.e. Gemma didn't
+  actually translate it), it's replaced with a known, explicitly-labeled
+  deterministic translation for a small set of supported demo phrases, or
+  cleared to `None` - GlucoRelay never presents foreign-language text to a
+  caregiver mislabeled as an English translation.
+- **Deterministic language normalization**
+  (`app/gemma_service.py::normalize_detected_language`), which runs
+  *before* the english-summary step above so that step always has an
+  accurate signal to branch on. A language Gemma actually reported is
+  always preserved as-is. When it's missing, the transcript is checked
+  against the exact same, carefully scoped Spanish/English phrase lists
+  already used by the action-evidence check above (`_SPANISH_INTENT_MARKERS`
+  / `_ENGLISH_INTENT_MARKERS` - reused, not duplicated) - never a looser
+  "does this look foreign" heuristic, and never a bare contact name (e.g.
+  "Helper" alone never implies Spanish or an emergency). If neither list
+  matches, the language is set to `"und"` (undetermined) rather than
+  fabricating a guess. This is what fixed the real live-run case where
+  Gemma correctly extracted `action: need_help`, `requested_contact:
+  Helper`, and an English `english_summary` for "Me siento confundida. Por
+  favor llama a Helper." but left `detected_language` empty.
 
 See `tests/test_semantic_validation.py` for the mocked-Gemma regression
-tests covering all of the above.
+tests covering all of the above, including the real live-smoke-test
+failures this hardening fixes.
+
+### Diagnosing a Gemma rejection (failure-stage reporting)
+
+When `analyze_patient_checkin`/`generate_caregiver_handoff` fall back, the
+returned `note` (and the `gemma_trace`/timeline entries built from it) is
+`"<stage>[:<safe detail>][;retry_attempted=true]"`, identifying precisely
+which stage produced an unusable result instead of one generic message:
+
+- `gemma_disabled` / `gemma_not_configured` - Gemma was never called (env
+  config).
+- `sdk_request_failed` - the API call itself raised (network, auth, quota,
+  etc.); detail is the exception class name only.
+- `empty_model_response` - the call succeeded but returned no usable
+  text/parsed content, and the SDK did **not** explicitly report a safety
+  block.
+- `safety_blocked` - the call succeeded but returned no usable
+  text/parsed content, and the SDK's own finish/block reason *explicitly*
+  says so (e.g. `finish_reason=SAFETY`) - this is reported **only** when
+  the SDK itself says so, never inferred merely from an empty response
+  (an earlier version of this project incorrectly assumed every empty
+  response was a safety block and changed `safety_settings` to compensate;
+  a real live run proved the actual failure was `json_parse_failed`
+  instead, so that change was reverted - see below).
+- `json_parse_failed` - no complete, balanced JSON object could be
+  extracted from the response text (after stripping an optional
+  ` ```json `/` ``` ` Markdown fence and tolerating harmless leading/
+  trailing prose around the object - see "Hardened JSON parsing" below).
+- `schema_validation_failed` - a JSON object was extracted but didn't
+  match the expected schema; detail names which fields failed, never
+  their values.
+- `safety_scan_failed` - passed schema validation but tripped
+  `_contains_unsafe_content`; detail is the matched banned phrase.
+
+`detail` always includes only safe, structural diagnostics - Gemini's
+finish/block reason code, the response text's character length, whether
+it was blank, whether it contained a Markdown fence, and/or an exception
+class name. It never includes an API key, a system prompt, hidden
+reasoning, a complete raw SDK object, or the full patient transcript.
+`scripts/smoke_test_gemma.py` prints this same `stage`/`detail`/
+`retry_attempted` breakdown for every transcript that falls back.
+
+#### Hardened JSON parsing, with one deterministic retry
+
+`_extract_parsed_detailed` (used by both Gemma calls) tries, in order:
+(1) `response.parsed` when the SDK already gives back the expected type;
+(2) otherwise `response.text`, with an optional single Markdown fence
+stripped; (3) the first complete, brace-balanced JSON object found in that
+text (so harmless leading/trailing prose like "Here is the result: {...}
+Let me know if you need anything else." doesn't cause a false parse
+failure); (4) `json.loads`; (5) Pydantic validation.
+
+If step (3), (4), or (5) fails (`json_parse_failed` or
+`schema_validation_failed`), `analyze_patient_checkin` retries the Gemma
+request **exactly once** with `temperature=0.0` (the lowest/most
+deterministic setting) and an added instruction reminding the model to
+return one JSON object and nothing else. If the retry also fails, the
+deterministic fallback parser is used. `analyze_patient_checkin` has no
+side effects of its own (it never proposes, validates, or executes an
+application tool), so this internal retry can never cause a duplicate
+application action - the caller always receives exactly one final
+`PatientCheckInAnalysis` regardless of how many Gemma calls happened
+internally. See
+`tests/test_gemma_response_parsing.py` for the full regression suite
+(fenced JSON, leading/trailing prose, empty responses, an explicit
+safety-blocked response, malformed JSON, a successful retry, and a failed
+retry that correctly falls back).
+
+**On `safety_settings`:** this project briefly set `safety_settings` to
+`BLOCK_ONLY_HIGH` on both Gemma calls, based on an unproven assumption
+that Gemini's own upstream content-safety filter was blocking a
+distress-related transcript. A real live run of `scripts/smoke_test_gemma.py`
+showed the actual failure stage was `json_parse_failed`, not a safety
+block, so that change has been reverted - both calls now use Gemini's
+**default** safety behavior. GlucoRelay does not maintain any safety
+looseness that isn't backed by a specific, reproduced failure and a
+regression test for it.
 
 ## On "function calling" (what this project actually does, and doesn't, claim)
 
@@ -502,13 +616,15 @@ over the network - it is intentionally excluded from pytest. To run it:
    .venv\Scripts\python.exe scripts/smoke_test_gemma.py
    ```
 
-It refuses to run if either variable is missing, sends seven representative
-transcripts (including an ambiguous retraction and a Spanish "Helper"
-contact request), and for each one prints the validated
-`PatientCheckInAnalysis` and proposed tool **and asserts the expected
-semantic outcome** - it does not merely print schema-valid output. It exits
-nonzero if any transcript fails validation, silently falls back to the
-deterministic parser, or produces the wrong semantic result, e.g.:
+It refuses to run if either variable is missing, sends eight representative
+transcripts (including an ambiguous retraction, an explicit English
+inability-to-stand statement, a Spanish "Helper" help request, and a
+Spanish contact mention with no request), and for each one prints the
+validated `PatientCheckInAnalysis`, proposed tool, and pipeline `stage`
+(see "Diagnosing a Gemma rejection" above) **and asserts the expected
+semantic outcome** - it does not merely print schema-valid output. It
+exits nonzero if any transcript fails validation, silently falls back to
+the deterministic parser, or produces the wrong semantic result, e.g.:
 
 - *"My backpack is red."* must resolve to `action: "unknown"` (regression
   test for the "unsupported okay" bug described above).
@@ -519,6 +635,24 @@ deterministic parser, or produces the wrong semantic result, e.g.:
   reworded/rewritten summary).
 - *"I feel confused and I need Helper to help me."* and its Spanish
   equivalent must both extract `requested_contact: "Helper"`.
+- *"I'm awake, but I'm alone and I can't stand up."* must resolve to
+  `action: "need_help"` **via Gemma** (not the fallback parser, i.e. it
+  must fail the run if it falls back) - a regression check for a real
+  live-run failure where this transcript's response failed JSON parsing
+  (see "Hardened JSON parsing" above - the retry/balanced-JSON-extraction
+  logic is what actually fixes this, not a safety-setting change).
+- *"Me siento confundida. Por favor llama a Helper."* must resolve to
+  `action: "need_help"`, `detected_language: "es"` (this specific field is
+  asserted because a real live run once produced everything else
+  correctly but left this empty), `requested_contact: "Helper"`, and an
+  English `english_summary`.
+- *"Mi amigo Helper vino a visitarme ayer."* (a contact mention with no
+  request) must stay `action: "unknown"`.
+
+When a transcript required the internal one-time retry (see "Hardened
+JSON parsing" above), the smoke test prints `retry_attempted: true`
+alongside its result - this is informational, not a failure, as long as
+the final result is still correct via Gemma.
 
 It also never prints the API key.
 

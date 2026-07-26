@@ -104,7 +104,7 @@ def test_handoff_generation_failure_uses_deterministic_fallback(monkeypatch):
 
     handoff, source, reason = generate_caregiver_handoff(event, analysis)
     assert source == "fallback"
-    assert reason == "gemma_handoff_request_failed"
+    assert reason == "gemma_handoff_sdk_request_failed:RuntimeError"
     assert handoff.requested_contact == "Luis"
 
 

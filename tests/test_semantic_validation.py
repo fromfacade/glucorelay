@@ -10,7 +10,7 @@ needing network access.
 """
 
 from app import gemma_service
-from app.gemma_service import analyze_patient_checkin
+from app.gemma_service import _contains_unsafe_content, analyze_patient_checkin
 from app.models import PatientCheckInAnalysis
 from app.tools import propose_tool
 
@@ -205,3 +205,259 @@ def test_spanish_help_request_for_helper_is_understood(monkeypatch):
     assert source == "gemma"
     assert analysis.action == "need_help"
     assert analysis.requested_contact == "Helper"
+
+
+# --- Regression tests: "can't stand up" safety-denylist false positive,
+# Spanish explicit-intent reclassification, and english_summary
+# normalization (live Gemma smoke test failures) -------------------------
+
+
+def test_safety_denylist_does_not_reject_reported_physical_limitations():
+    """The treatment-language safety re-scan must never fire on a patient
+    reporting they can't stand/move - those are exactly what `need_help`
+    exists to capture, not a generated medical instruction."""
+    for phrase in (
+        "I'm awake, but I'm alone and I can't stand up.",
+        "I am unable to stand right now.",
+        "I can't move at all.",
+        "unable to stand",
+        "can't stand up",
+    ):
+        assert _contains_unsafe_content(phrase) is None
+
+
+def test_english_cant_stand_up_produces_need_help_via_gemma_without_fallback(monkeypatch):
+    """Regression test for the live smoke-test failure where this exact
+    transcript fell back to the deterministic parser instead of using
+    Gemma's (correct) need_help classification."""
+    transcript = "I'm awake, but I'm alone and I can't stand up."
+    _mock_gemma_response(
+        monkeypatch,
+        PatientCheckInAnalysis(
+            action="need_help",
+            summary=transcript,
+            english_summary=transcript,
+            reported_condition="alone and unable to stand",
+            responsive=True,
+            detected_language="en",
+        ),
+    )
+    analysis, source, _note = analyze_patient_checkin(transcript)
+
+    assert source == "gemma"
+    assert analysis.action == "need_help"
+
+    tool = propose_tool(analysis)
+    assert tool.name == "request_caregiver_help"
+
+
+def test_unsupported_spanish_okay_is_reclassified_to_need_help(monkeypatch):
+    """Regression test for the live smoke-test failure: Gemma incorrectly
+    classified an explicit Spanish help request as 'okay'. The semantic
+    validation layer must recognize the explicit contact-request phrase
+    ("llama a") and the reported-condition phrase ("me siento confundida")
+    and reclassify to need_help - not merely downgrade to 'unknown'."""
+    transcript = "Me siento confundida. Por favor llama a Helper."
+    _mock_gemma_response(
+        monkeypatch,
+        PatientCheckInAnalysis(
+            action="okay",
+            summary=transcript,
+            requested_contact="Helper",
+            reported_condition="confundida",
+            detected_language="es",
+        ),
+    )
+    analysis, source, note = analyze_patient_checkin(transcript)
+
+    assert analysis.action == "need_help"
+    assert source == "gemma"  # a semantic correction is NOT a Gemma failure
+    assert "reclassified_to_need_help_from:okay" in note
+    assert analysis.detected_language == "es"
+    assert analysis.requested_contact == "Helper"
+    assert analysis.reported_condition == "confundida"
+    assert analysis.english_summary == "I feel confused. Please call Helper."
+
+    tool = propose_tool(analysis)
+    assert tool.name == "request_caregiver_help"
+
+
+def test_spanish_contact_mention_without_a_request_remains_unknown(monkeypatch):
+    """A contact name appearing in Spanish text alone - with no help or
+    contact-request verb, and no reported inability - must NOT trigger
+    need_help."""
+    transcript = "Mi amigo Helper vino a visitarme ayer."
+    _mock_gemma_response(
+        monkeypatch,
+        PatientCheckInAnalysis(
+            action="okay",
+            summary=transcript,
+            requested_contact="Helper",
+            detected_language="es",
+        ),
+    )
+    analysis, source, note = analyze_patient_checkin(transcript)
+
+    assert analysis.action == "unknown"
+    assert source == "gemma"
+    assert "unsupported_action_downgraded:okay" in note
+
+
+def test_english_summary_not_copied_when_language_is_genuinely_undetermined(monkeypatch):
+    """Regression test: when neither Spanish nor English evidence phrases
+    are present, detected_language must resolve to "und" (never guessed),
+    and a missing summary must never be copied into english_summary (that
+    would falsely label unidentified text as an English translation)."""
+    transcript = "Static noise on the line, mostly silence."
+    _mock_gemma_response(
+        monkeypatch,
+        PatientCheckInAnalysis(
+            action="unknown",
+            summary=transcript,
+            detected_language=None,
+        ),
+    )
+    analysis, _source, _note = analyze_patient_checkin(transcript)
+
+    assert analysis.detected_language == "und"
+    assert analysis.english_summary is None
+
+
+def test_spanish_marker_present_but_no_known_translation_leaves_summary_none(monkeypatch):
+    """When language normalization detects Spanish but there's no known
+    deterministic translation for this exact transcript, english_summary
+    must stay None rather than fabricate one - only detected_language is
+    filled in."""
+    transcript = "Estoy bien, gracias."
+    _mock_gemma_response(
+        monkeypatch,
+        PatientCheckInAnalysis(
+            action="okay",
+            summary=transcript,
+            detected_language=None,
+        ),
+    )
+    analysis, source, note = analyze_patient_checkin(transcript)
+
+    assert analysis.detected_language == "es"
+    assert analysis.english_summary is None
+    assert source == "gemma"
+    assert "detected_language_normalized:es" in note
+
+
+# --- Regression tests: deterministic language normalization
+# (`normalize_detected_language`) - live smoke-test failure where
+# "Me siento confundida. Por favor llama a Helper." correctly produced
+# need_help/Helper/english_summary but left detected_language as None. ----
+
+
+def test_spanish_help_request_gets_es_when_model_omits_language(monkeypatch):
+    """The exact live-smoke-test regression: Gemma got everything right
+    except detected_language, which it left as None."""
+    transcript = "Me siento confundida. Por favor llama a Helper."
+    _mock_gemma_response(
+        monkeypatch,
+        PatientCheckInAnalysis(
+            action="need_help",
+            summary=transcript,
+            english_summary="I feel confused. Please call Helper.",
+            requested_contact="Helper",
+            reported_condition="confundida",
+            detected_language=None,
+        ),
+    )
+    analysis, source, note = analyze_patient_checkin(transcript)
+
+    assert analysis.detected_language == "es"
+    assert analysis.action == "need_help"
+    assert analysis.requested_contact == "Helper"
+    assert analysis.english_summary == "I feel confused. Please call Helper."
+    assert source == "gemma"
+    assert "detected_language_normalized:es" in note
+
+    tool = propose_tool(analysis)
+    assert tool.name == "request_caregiver_help"
+
+
+def test_spanish_non_emergency_contact_mention_gets_es_and_stays_unknown(monkeypatch):
+    """A Spanish transcript can contain a scoped language marker (so we
+    correctly identify it as Spanish) without containing any actual
+    request/emergency evidence - the action must still resolve to
+    "unknown", never need_help, from a contact mention alone."""
+    transcript = "Estoy bien, mi amigo Helper vino a visitarme ayer."
+    _mock_gemma_response(
+        monkeypatch,
+        PatientCheckInAnalysis(
+            action="false_alarm",  # Gemma's guess has no false_alarm evidence either.
+            summary=transcript,
+            requested_contact="Helper",
+            detected_language=None,
+        ),
+    )
+    analysis, source, note = analyze_patient_checkin(transcript)
+
+    assert analysis.detected_language == "es"
+    assert analysis.action == "unknown"
+    assert source == "gemma"
+    assert "detected_language_normalized:es" in note
+    assert "unsupported_action_downgraded:false_alarm" in note
+
+
+def test_english_transcript_gets_en_when_model_omits_language(monkeypatch):
+    transcript = "I'm treating it with juice right now."
+    _mock_gemma_response(
+        monkeypatch,
+        PatientCheckInAnalysis(
+            action="treating",
+            summary=transcript,
+            detected_language=None,
+        ),
+    )
+    analysis, source, note = analyze_patient_checkin(transcript)
+
+    assert analysis.detected_language == "en"
+    assert analysis.action == "treating"
+    assert analysis.english_summary == analysis.summary
+    assert source == "gemma"
+    assert "detected_language_normalized:en" in note
+
+
+def test_model_provided_language_is_always_preserved(monkeypatch):
+    """normalize_detected_language must never override a language Gemma
+    actually reported, even an unusual/unexpected value."""
+    transcript = "I'm okay."
+    _mock_gemma_response(
+        monkeypatch,
+        PatientCheckInAnalysis(
+            action="okay",
+            summary=transcript,
+            english_summary=transcript,
+            detected_language="en-US",
+        ),
+    )
+    analysis, _source, note = analyze_patient_checkin(transcript)
+
+    assert analysis.detected_language == "en-US"
+    assert note is None
+
+
+def test_spanish_summary_mislabeled_as_english_is_corrected(monkeypatch):
+    """Regression test: Gemma echoing the Spanish summary verbatim into
+    english_summary (i.e. not actually translating) must be corrected, not
+    trusted at face value."""
+    transcript = "Me siento confundida. Por favor llama a Helper."
+    _mock_gemma_response(
+        monkeypatch,
+        PatientCheckInAnalysis(
+            action="need_help",
+            summary=transcript,
+            english_summary=transcript,  # Gemma failed to translate.
+            requested_contact="Helper",
+            detected_language="es",
+        ),
+    )
+    analysis, _source, note = analyze_patient_checkin(transcript)
+
+    assert analysis.english_summary != transcript
+    assert analysis.english_summary == "I feel confused. Please call Helper."
+    assert "english_summary_mislabeled_corrected" in note
