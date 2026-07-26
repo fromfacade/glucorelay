@@ -122,6 +122,9 @@
         <h2>Active event</h2>
         <p>Status: <span id="status" class="status">none</span></p>
         <p id="reason" class="muted">No active emergency event.</p>
+        <p id="patientSummary" class="muted"></p>
+        <p id="caregiverHandoff" class="muted"></p>
+        <p id="caregiverLink" class="muted"></p>
 
         <div class="buttons">
           <button id="treatingBtn" onclick="patientResponse('treating')">
@@ -146,7 +149,40 @@
           <button id="resolveBtn" class="safe" onclick="resolveEvent()">
             Resolve event
           </button>
+          <button id="locationBtn" onclick="shareLocation()">
+            Share my location
+          </button>
         </div>
+      </section>
+
+      <section class="card">
+        <h2>Voice check-in</h2>
+        <p class="muted">
+          Only active while a check-in is required. The browser converts
+          speech to text; Gemma only classifies what you said into okay /
+          treating / need help / false alarm / unknown.
+        </p>
+        <div class="buttons">
+          <button id="micBtn" onclick="startVoiceCheckIn()">
+            🎤 Speak check-in
+          </button>
+        </div>
+        <textarea
+          id="transcriptBox"
+          rows="2"
+          style="width: 100%; margin-top: 10px"
+          placeholder="Transcript appears here, or type it manually"
+        ></textarea>
+        <div class="buttons" style="margin-top: 10px">
+          <button id="sendTranscriptBtn" onclick="sendVoiceCheckIn()">
+            Send transcript
+          </button>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>Incident timeline</h2>
+        <ul id="timelineList" class="muted"></ul>
       </section>
 
       <section class="card">
@@ -194,6 +230,16 @@
         document.getElementById("reason").textContent =
           event?.reason ?? "No active emergency event.";
 
+        const langSuffix = event?.original_language && event.original_language !== "en"
+          ? ` (detected language: ${event.original_language})`
+          : "";
+        document.getElementById("patientSummary").textContent = event?.patient_response_summary
+          ? `Patient check-in: ${event.patient_response_summary}${langSuffix}`
+          : "";
+        document.getElementById("caregiverHandoff").textContent = event?.caregiver_handoff
+          ? `Caregiver handoff (${event.caregiver_handoff_source}): ${event.caregiver_handoff.headline} - ${event.caregiver_handoff.handoff}`
+          : "";
+
         const hasEvent = Boolean(event);
         [
           "treatingBtn",
@@ -202,9 +248,28 @@
           "timeoutBtn",
           "ackBtn",
           "resolveBtn",
+          "locationBtn",
         ].forEach((id) => {
           document.getElementById(id).disabled = !hasEvent;
         });
+
+        const canVoiceCheckIn = event?.status === "check_in_required";
+        ["micBtn", "sendTranscriptBtn"].forEach((id) => {
+          document.getElementById(id).disabled = !canVoiceCheckIn;
+        });
+
+        const caregiverLink = document.getElementById("caregiverLink");
+        caregiverLink.innerHTML = event
+          ? `Caregiver link: <a href="/caregiver/${event.public_token}" target="_blank" rel="noopener">/caregiver/${event.public_token}</a>`
+          : "";
+
+        const timelineList = document.getElementById("timelineList");
+        timelineList.innerHTML = "";
+        for (const entry of event?.timeline ?? []) {
+          const li = document.createElement("li");
+          li.textContent = `${new Date(entry.created_at).toLocaleTimeString()} - ${entry.message}`;
+          timelineList.append(li);
+        }
       }
 
       function requireEvent() {
@@ -245,7 +310,7 @@
         if (!requireEvent()) return;
         await request(`/api/events/${activeEventId}/acknowledge`, {
           method: "POST",
-          body: JSON.stringify({ caregiver_name: "Luis" }),
+          body: JSON.stringify({ caregiver_name: "Helper" }),
         });
       }
 
@@ -258,6 +323,64 @@
 
       async function resetDemo() {
         await request("/api/reset", { method: "POST" });
+      }
+
+      async function sendVoiceCheckIn() {
+        if (!requireEvent()) return;
+        const transcript = document.getElementById("transcriptBox").value.trim();
+        if (!transcript) {
+          alert("Speak or type a transcript first.");
+          return;
+        }
+        await request(`/api/events/${activeEventId}/voice-check-in`, {
+          method: "POST",
+          body: JSON.stringify({ transcript, language: "en-US" }),
+        });
+      }
+
+      function startVoiceCheckIn() {
+        const SpeechRecognition =
+          window.SpeechRecognition || window.webkitSpeechRecognition;
+        if (!SpeechRecognition) {
+          alert(
+            "This browser doesn't support speech recognition. Type the transcript instead.",
+          );
+          return;
+        }
+        const recognizer = new SpeechRecognition();
+        recognizer.lang = "en-US";
+        recognizer.interimResults = false;
+        recognizer.maxAlternatives = 1;
+        recognizer.onresult = (event) => {
+          const transcript = event.results[0][0].transcript;
+          document.getElementById("transcriptBox").value = transcript;
+        };
+        recognizer.onerror = (event) => {
+          alert(`Speech recognition error: ${event.error}`);
+        };
+        // Listens only for this single check-in utterance, then stops -
+        // this is not a continuously-listening wake-word feature.
+        recognizer.start();
+      }
+
+      async function shareLocation() {
+        if (!requireEvent()) return;
+        if (!navigator.geolocation) {
+          alert("Geolocation isn't available in this browser.");
+          return;
+        }
+        navigator.geolocation.getCurrentPosition(
+          async (position) => {
+            await request(`/api/events/${activeEventId}/location`, {
+              method: "POST",
+              body: JSON.stringify({
+                latitude: position.coords.latitude,
+                longitude: position.coords.longitude,
+              }),
+            });
+          },
+          (error) => alert(`Could not get location: ${error.message}`),
+        );
       }
 
       refresh();
