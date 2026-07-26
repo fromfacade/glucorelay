@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>GlucoRelay Demo</title>
+    <style>
+      :root {
+        font-family: Inter, system-ui, sans-serif;
+        color-scheme: dark;
+        background: #101114;
+        color: #f6f7fb;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        padding: 24px;
+      }
+      main {
+        width: min(900px, 100%);
+        margin: auto;
+      }
+      .card {
+        background: #1a1c22;
+        border: 1px solid #343844;
+        border-radius: 16px;
+        padding: 20px;
+        margin-bottom: 16px;
+      }
+      .reading {
+        font-size: 64px;
+        font-weight: 800;
+        margin: 8px 0;
+      }
+      .muted {
+        color: #b6bbc8;
+      }
+      .status {
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+      }
+      .buttons {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+      }
+      button {
+        min-height: 44px;
+        border: 0;
+        border-radius: 10px;
+        padding: 10px 14px;
+        font-weight: 700;
+        cursor: pointer;
+      }
+      button:disabled {
+        opacity: 0.45;
+        cursor: not-allowed;
+      }
+      .danger {
+        background: #ff626b;
+        color: #190305;
+      }
+      .primary {
+        background: #7da2ff;
+        color: #071021;
+      }
+      .safe {
+        background: #6fd6a2;
+        color: #04180d;
+      }
+      pre {
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+        background: #0c0d10;
+        padding: 12px;
+        border-radius: 10px;
+        max-height: 320px;
+        overflow: auto;
+      }
+      .warning {
+        border-left: 4px solid #f2be55;
+        padding-left: 12px;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>GlucoRelay</h1>
+      <p class="warning">
+        Hackathon simulation only. Not a medical device or real emergency
+        system.
+      </p>
+
+      <section class="card">
+        <div class="muted">Latest simulated reading</div>
+        <div id="reading" class="reading">--</div>
+        <div id="trend" class="muted">No reading yet</div>
+      </section>
+
+      <section class="card">
+        <h2>Glucose simulator</h2>
+        <div class="buttons">
+          <button class="safe" onclick="sendReading(110, 'flat')">
+            Normal reading
+          </button>
+          <button class="primary" onclick="sendReading(67, 'single_down')">
+            Low reading
+          </button>
+          <button class="danger" onclick="sendReading(52, 'double_down')">
+            Urgent low
+          </button>
+          <button class="primary" onclick="sendReading(280, 'single_up')">
+            High reading
+          </button>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>Active event</h2>
+        <p>Status: <span id="status" class="status">none</span></p>
+        <p id="reason" class="muted">No active emergency event.</p>
+
+        <div class="buttons">
+          <button id="treatingBtn" onclick="patientResponse('treating')">
+            I'm treating it
+          </button>
+          <button
+            id="helpBtn"
+            class="danger"
+            onclick="patientResponse('need_help')"
+          >
+            I need help
+          </button>
+          <button id="falseBtn" onclick="patientResponse('false_alarm')">
+            False alarm
+          </button>
+          <button id="timeoutBtn" class="danger" onclick="timeoutEvent()">
+            Simulate no response
+          </button>
+          <button id="ackBtn" class="primary" onclick="acknowledge()">
+            Acknowledge as caregiver
+          </button>
+          <button id="resolveBtn" class="safe" onclick="resolveEvent()">
+            Resolve event
+          </button>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>API response</h2>
+        <pre id="output">Ready.</pre>
+      </section>
+
+      <button onclick="resetDemo()">Reset demo</button>
+    </main>
+
+    <script>
+      let activeEventId = null;
+
+      async function request(path, options = {}) {
+        const response = await fetch(path, {
+          headers: { "Content-Type": "application/json" },
+          ...options,
+        });
+        const data = await response.json();
+        document.getElementById("output").textContent = JSON.stringify(
+          data,
+          null,
+          2,
+        );
+        if (!response.ok) throw new Error(data.detail || "Request failed");
+        await refresh();
+        return data;
+      }
+
+      async function refresh() {
+        const response = await fetch("/api/state");
+        const state = await response.json();
+
+        const reading = state.latest_reading;
+        document.getElementById("reading").textContent = reading
+          ? `${reading.value_mg_dl} mg/dL`
+          : "--";
+        document.getElementById("trend").textContent = reading
+          ? reading.trend.replaceAll("_", " ")
+          : "No reading yet";
+
+        const event = state.active_event;
+        activeEventId = event?.id ?? null;
+        document.getElementById("status").textContent = event?.status ?? "none";
+        document.getElementById("reason").textContent =
+          event?.reason ?? "No active emergency event.";
+
+        const hasEvent = Boolean(event);
+        [
+          "treatingBtn",
+          "helpBtn",
+          "falseBtn",
+          "timeoutBtn",
+          "ackBtn",
+          "resolveBtn",
+        ].forEach((id) => {
+          document.getElementById(id).disabled = !hasEvent;
+        });
+      }
+
+      function requireEvent() {
+        if (!activeEventId) {
+          alert("Create an event first.");
+          return false;
+        }
+        return true;
+      }
+
+      async function sendReading(value, trend) {
+        await request("/api/readings", {
+          method: "POST",
+          body: JSON.stringify({
+            value_mg_dl: value,
+            trend,
+            source: "simulator",
+          }),
+        });
+      }
+
+      async function patientResponse(response) {
+        if (!requireEvent()) return;
+        await request(`/api/events/${activeEventId}/patient-response`, {
+          method: "POST",
+          body: JSON.stringify({ response }),
+        });
+      }
+
+      async function timeoutEvent() {
+        if (!requireEvent()) return;
+        await request(`/api/events/${activeEventId}/timeout`, {
+          method: "POST",
+        });
+      }
+
+      async function acknowledge() {
+        if (!requireEvent()) return;
+        await request(`/api/events/${activeEventId}/acknowledge`, {
+          method: "POST",
+          body: JSON.stringify({ caregiver_name: "Luis" }),
+        });
+      }
+
+      async function resolveEvent() {
+        if (!requireEvent()) return;
+        await request(`/api/events/${activeEventId}/resolve`, {
+          method: "POST",
+        });
+      }
+
+      async function resetDemo() {
+        await request("/api/reset", { method: "POST" });
+      }
+
+      refresh();
+    </script>
+  </body>
+</html>
