@@ -1,389 +1,160 @@
 <!doctype html>
 <html lang="en">
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>GlucoRelay Demo</title>
-    <style>
-      :root {
-        font-family: Inter, system-ui, sans-serif;
-        color-scheme: dark;
-        background: #101114;
-        color: #f6f7fb;
-      }
-      * {
-        box-sizing: border-box;
-      }
-      body {
-        margin: 0;
-        padding: 24px;
-      }
-      main {
-        width: min(900px, 100%);
-        margin: auto;
-      }
-      .card {
-        background: #1a1c22;
-        border: 1px solid #343844;
-        border-radius: 16px;
-        padding: 20px;
-        margin-bottom: 16px;
-      }
-      .reading {
-        font-size: 64px;
-        font-weight: 800;
-        margin: 8px 0;
-      }
-      .muted {
-        color: #b6bbc8;
-      }
-      .status {
-        font-weight: 700;
-        text-transform: uppercase;
-        letter-spacing: 0.06em;
-      }
-      .buttons {
-        display: flex;
-        flex-wrap: wrap;
-        gap: 10px;
-      }
-      button {
-        min-height: 44px;
-        border: 0;
-        border-radius: 10px;
-        padding: 10px 14px;
-        font-weight: 700;
-        cursor: pointer;
-      }
-      button:disabled {
-        opacity: 0.45;
-        cursor: not-allowed;
-      }
-      .danger {
-        background: #ff626b;
-        color: #190305;
-      }
-      .primary {
-        background: #7da2ff;
-        color: #071021;
-      }
-      .safe {
-        background: #6fd6a2;
-        color: #04180d;
-      }
-      pre {
-        white-space: pre-wrap;
-        overflow-wrap: anywhere;
-        background: #0c0d10;
-        padding: 12px;
-        border-radius: 10px;
-        max-height: 320px;
-        overflow: auto;
-      }
-      .warning {
-        border-left: 4px solid #f2be55;
-        padding-left: 12px;
-      }
-    </style>
-  </head>
-  <body>
-    <main>
-      <h1>GlucoRelay</h1>
-      <p class="warning">
-        Hackathon simulation only. Not a medical device or real emergency
-        system.
-      </p>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#07111f">
+  <title>GlucoRelay Patient Demo</title>
+  <link rel="stylesheet" href="/static/styles.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body data-page="patient">
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="GlucoRelay home">
+      <span class="brand-mark" aria-hidden="true">G</span>
+      <span><strong>GlucoRelay</strong><small>Emergency coordination demo</small></span>
+    </a>
+    <nav class="top-actions" aria-label="Primary navigation">
+      <span id="connectionPill" class="pill pill-neutral">Connecting</span>
+      <button id="audioToggleBtn" class="button button-ghost audio-toggle" type="button" aria-pressed="true">Audio on</button>
+      <a class="button button-ghost" href="/caregiver">Caregiver view</a>
+    </nav>
+  </header>
 
-      <section class="card">
-        <div class="muted">Latest simulated reading</div>
-        <div id="reading" class="reading">--</div>
-        <div id="trend" class="muted">No reading yet</div>
-      </section>
+  <main class="shell">
+    <section class="demo-notice" role="note">
+      <strong>Hackathon simulation.</strong> Not a medical device and not a replacement for emergency services.
+    </section>
 
-      <section class="card">
-        <h2>Glucose simulator</h2>
-        <div class="buttons">
-          <button class="safe" onclick="sendReading(110, 'flat')">
-            Normal reading
-          </button>
-          <button class="primary" onclick="sendReading(67, 'single_down')">
-            Low reading
-          </button>
-          <button class="danger" onclick="sendReading(52, 'double_down')">
-            Urgent low
-          </button>
-          <button class="primary" onclick="sendReading(280, 'single_up')">
-            High reading
-          </button>
+    <section class="hero-grid">
+      <article id="readingCard" class="card reading-card state-neutral">
+        <div class="card-heading">
+          <div>
+            <p class="eyebrow">Current glucose</p>
+            <h1 id="readingValue">--</h1>
+          </div>
+          <span id="readingBadge" class="status-badge">No data</span>
         </div>
-      </section>
-
-      <section class="card">
-        <h2>Active event</h2>
-        <p>Status: <span id="status" class="status">none</span></p>
-        <p id="reason" class="muted">No active emergency event.</p>
-        <p id="patientSummary" class="muted"></p>
-        <p id="caregiverHandoff" class="muted"></p>
-        <p id="caregiverLink" class="muted"></p>
-
-        <div class="buttons">
-          <button id="treatingBtn" onclick="patientResponse('treating')">
-            I'm treating it
-          </button>
-          <button
-            id="helpBtn"
-            class="danger"
-            onclick="patientResponse('need_help')"
-          >
-            I need help
-          </button>
-          <button id="falseBtn" onclick="patientResponse('false_alarm')">
-            False alarm
-          </button>
-          <button id="timeoutBtn" class="danger" onclick="timeoutEvent()">
-            Simulate no response
-          </button>
-          <button id="ackBtn" class="primary" onclick="acknowledge()">
-            Acknowledge as caregiver
-          </button>
-          <button id="resolveBtn" class="safe" onclick="resolveEvent()">
-            Resolve event
-          </button>
-          <button id="locationBtn" onclick="shareLocation()">
-            Share my location
-          </button>
+        <div class="reading-meta">
+          <span id="trendValue">Trend unknown</span>
+          <span id="readingTime">Waiting for a reading</span>
         </div>
-      </section>
-
-      <section class="card">
-        <h2>Voice check-in</h2>
-        <p class="muted">
-          Only active while a check-in is required. The browser converts
-          speech to text; Gemma only classifies what you said into okay /
-          treating / need help / false alarm / unknown.
-        </p>
-        <div class="buttons">
-          <button id="micBtn" onclick="startVoiceCheckIn()">
-            🎤 Speak check-in
-          </button>
+        <div class="range-track" aria-label="Configured glucose thresholds">
+          <span class="range urgent"></span><span class="range low"></span><span class="range normal"></span><span class="range high"></span>
         </div>
-        <textarea
-          id="transcriptBox"
-          rows="2"
-          style="width: 100%; margin-top: 10px"
-          placeholder="Transcript appears here, or type it manually"
-        ></textarea>
-        <div class="buttons" style="margin-top: 10px">
-          <button id="sendTranscriptBtn" onclick="sendVoiceCheckIn()">
-            Send transcript
-          </button>
+        <div class="range-labels">
+          <span id="urgentThreshold">Urgent</span><span id="lowThreshold">Low</span><span id="highThreshold">High</span>
         </div>
-      </section>
+      </article>
 
-      <section class="card">
-        <h2>Incident timeline</h2>
-        <ul id="timelineList" class="muted"></ul>
-      </section>
+      <article class="card event-card">
+        <div class="card-heading">
+          <div>
+            <p class="eyebrow">Active workflow</p>
+            <h2 id="eventTitle">No active event</h2>
+          </div>
+          <span id="eventStatus" class="status-badge">Idle</span>
+        </div>
+        <p id="eventReason" class="muted">A warning will appear automatically when the rules engine detects an abnormal reading.</p>
+        <ol class="workflow" aria-label="Emergency workflow">
+          <li id="stepDetected"><span>1</span>Detected</li>
+          <li id="stepCheckin"><span>2</span>Patient check-in</li>
+          <li id="stepContact"><span>3</span>Contact caregiver</li>
+          <li id="stepAck"><span>4</span>Acknowledged</li>
+        </ol>
+      </article>
+    </section>
 
-      <section class="card">
-        <h2>API response</h2>
-        <pre id="output">Ready.</pre>
-      </section>
+    <section class="content-grid">
+      <article class="card simulator-card">
+        <div class="card-heading">
+          <div><p class="eyebrow">Demo controls</p><h2>Submit a reading</h2></div>
+        </div>
+        <form id="readingForm" class="reading-form">
+          <label>
+            <span>Glucose value</span>
+            <div class="input-with-unit"><input id="readingInput" type="number" min="20" max="600" step="1" inputmode="numeric" placeholder="110" required><span>mg/dL</span></div>
+          </label>
+          <label>
+            <span>Trend</span>
+            <select id="trendInput">
+              <option value="unknown">Unknown</option>
+              <option value="double_down">Double down</option>
+              <option value="single_down">Single down</option>
+              <option value="flat" selected>Flat</option>
+              <option value="single_up">Single up</option>
+              <option value="double_up">Double up</option>
+            </select>
+          </label>
+          <button class="button button-primary" type="submit">Analyze reading</button>
+        </form>
+        <div class="preset-row" aria-label="Reading presets">
+          <button class="preset safe" data-reading="110" data-trend="flat">110 Normal</button>
+          <button class="preset caution" data-reading="67" data-trend="single_down">67 Low</button>
+          <button class="preset danger" data-reading="52" data-trend="double_down">52 Urgent</button>
+          <button class="preset caution" data-reading="280" data-trend="single_up">280 High</button>
+        </div>
+        <p class="helper">You enter only the number. The backend rules engine automatically classifies it using the configured thresholds.</p>
+      </article>
 
-      <button onclick="resetDemo()">Reset demo</button>
-    </main>
+      <article class="card chart-card">
+        <div class="card-heading">
+          <div><p class="eyebrow">Session trend</p><h2>Glucose chart</h2></div>
+          <button id="clearChartBtn" class="text-button" type="button">Clear</button>
+        </div>
+        <div class="chart-wrap"><canvas id="glucoseChart" aria-label="Session glucose chart"></canvas></div>
+        <div id="chartEmpty" class="empty-chart">Submit readings to build the chart.</div>
+      </article>
+    </section>
 
-    <script>
-      let activeEventId = null;
+    <section class="content-grid lower-grid">
+      <article class="card actions-card">
+        <div class="card-heading"><div><p class="eyebrow">Patient response</p><h2>What is happening?</h2></div></div>
+        <div class="action-grid">
+          <button id="treatingBtn" class="button button-primary" disabled>I'm treating it</button>
+          <button id="helpBtn" class="button button-danger" disabled>I need help</button>
+          <button id="falseAlarmBtn" class="button button-ghost" disabled>False alarm</button>
+          <button id="resolveBtn" class="button button-success" disabled>Resolve event</button>
+        </div>
+      </article>
 
-      async function request(path, options = {}) {
-        const response = await fetch(path, {
-          headers: { "Content-Type": "application/json" },
-          ...options,
-        });
-        const data = await response.json();
-        document.getElementById("output").textContent = JSON.stringify(
-          data,
-          null,
-          2,
-        );
-        if (!response.ok) throw new Error(data.detail || "Request failed");
-        await refresh();
-        return data;
-      }
+      <article class="card history-card">
+        <div class="card-heading"><div><p class="eyebrow">Audit trail</p><h2>Recent events</h2></div></div>
+        <div id="historyList" class="history-list"><p class="muted">No resolved events yet.</p></div>
+      </article>
+    </section>
 
-      async function refresh() {
-        const response = await fetch("/api/state");
-        const state = await response.json();
+    <section class="card debug-card">
+      <details>
+        <summary>Demo tools and API response</summary>
+        <div class="debug-actions">
+          <button id="timeoutBtn" class="button button-ghost" disabled>Simulate no response</button>
+          <button id="resetBtn" class="button button-ghost">Reset demo</button>
+        </div>
+        <pre id="apiOutput">Ready.</pre>
+      </details>
+    </section>
+  </main>
 
-        const reading = state.latest_reading;
-        document.getElementById("reading").textContent = reading
-          ? `${reading.value_mg_dl} mg/dL`
-          : "--";
-        document.getElementById("trend").textContent = reading
-          ? reading.trend.replaceAll("_", " ")
-          : "No reading yet";
+  <div id="emergencyOverlay" class="overlay" hidden>
+    <section class="overlay-card" role="dialog" aria-modal="true" aria-labelledby="overlayTitle">
+      <div class="alert-icon" aria-hidden="true">!</div>
+      <p class="eyebrow">Automatic rules-engine warning</p>
+      <h2 id="overlayTitle">Glucose check-in needed</h2>
+      <div id="overlayReading" class="overlay-reading">-- mg/dL</div>
+      <p id="overlayReason" class="overlay-reason"></p>
+      <div id="countdownBlock" class="countdown-block">
+        <div class="countdown-ring"><span id="countdownValue">30</span></div>
+        <p>Caregiver escalation begins if there is no response.</p>
+      </div>
+      <div class="overlay-actions">
+        <button id="overlayTreatingBtn" class="button button-primary">I'm treating it</button>
+        <button id="overlayHelpBtn" class="button button-danger">I need help now</button>
+        <button id="overlayFalseBtn" class="button button-ghost">False alarm</button>
+      </div>
+    </section>
+  </div>
 
-        const event = state.active_event;
-        activeEventId = event?.id ?? null;
-        document.getElementById("status").textContent = event?.status ?? "none";
-        document.getElementById("reason").textContent =
-          event?.reason ?? "No active emergency event.";
-
-        const langSuffix = event?.original_language && event.original_language !== "en"
-          ? ` (detected language: ${event.original_language})`
-          : "";
-        document.getElementById("patientSummary").textContent = event?.patient_response_summary
-          ? `Patient check-in: ${event.patient_response_summary}${langSuffix}`
-          : "";
-        document.getElementById("caregiverHandoff").textContent = event?.caregiver_handoff
-          ? `Caregiver handoff (${event.caregiver_handoff_source}): ${event.caregiver_handoff.headline} - ${event.caregiver_handoff.handoff}`
-          : "";
-
-        const hasEvent = Boolean(event);
-        [
-          "treatingBtn",
-          "helpBtn",
-          "falseBtn",
-          "timeoutBtn",
-          "ackBtn",
-          "resolveBtn",
-          "locationBtn",
-        ].forEach((id) => {
-          document.getElementById(id).disabled = !hasEvent;
-        });
-
-        const canVoiceCheckIn = event?.status === "check_in_required";
-        ["micBtn", "sendTranscriptBtn"].forEach((id) => {
-          document.getElementById(id).disabled = !canVoiceCheckIn;
-        });
-
-        const caregiverLink = document.getElementById("caregiverLink");
-        caregiverLink.innerHTML = event
-          ? `Caregiver link: <a href="/caregiver/${event.public_token}" target="_blank" rel="noopener">/caregiver/${event.public_token}</a>`
-          : "";
-
-        const timelineList = document.getElementById("timelineList");
-        timelineList.innerHTML = "";
-        for (const entry of event?.timeline ?? []) {
-          const li = document.createElement("li");
-          li.textContent = `${new Date(entry.created_at).toLocaleTimeString()} - ${entry.message}`;
-          timelineList.append(li);
-        }
-      }
-
-      function requireEvent() {
-        if (!activeEventId) {
-          alert("Create an event first.");
-          return false;
-        }
-        return true;
-      }
-
-      async function sendReading(value, trend) {
-        await request("/api/readings", {
-          method: "POST",
-          body: JSON.stringify({
-            value_mg_dl: value,
-            trend,
-            source: "simulator",
-          }),
-        });
-      }
-
-      async function patientResponse(response) {
-        if (!requireEvent()) return;
-        await request(`/api/events/${activeEventId}/patient-response`, {
-          method: "POST",
-          body: JSON.stringify({ response }),
-        });
-      }
-
-      async function timeoutEvent() {
-        if (!requireEvent()) return;
-        await request(`/api/events/${activeEventId}/timeout`, {
-          method: "POST",
-        });
-      }
-
-      async function acknowledge() {
-        if (!requireEvent()) return;
-        await request(`/api/events/${activeEventId}/acknowledge`, {
-          method: "POST",
-          body: JSON.stringify({ caregiver_name: "Helper" }),
-        });
-      }
-
-      async function resolveEvent() {
-        if (!requireEvent()) return;
-        await request(`/api/events/${activeEventId}/resolve`, {
-          method: "POST",
-        });
-      }
-
-      async function resetDemo() {
-        await request("/api/reset", { method: "POST" });
-      }
-
-      async function sendVoiceCheckIn() {
-        if (!requireEvent()) return;
-        const transcript = document.getElementById("transcriptBox").value.trim();
-        if (!transcript) {
-          alert("Speak or type a transcript first.");
-          return;
-        }
-        await request(`/api/events/${activeEventId}/voice-check-in`, {
-          method: "POST",
-          body: JSON.stringify({ transcript, language: "en-US" }),
-        });
-      }
-
-      function startVoiceCheckIn() {
-        const SpeechRecognition =
-          window.SpeechRecognition || window.webkitSpeechRecognition;
-        if (!SpeechRecognition) {
-          alert(
-            "This browser doesn't support speech recognition. Type the transcript instead.",
-          );
-          return;
-        }
-        const recognizer = new SpeechRecognition();
-        recognizer.lang = "en-US";
-        recognizer.interimResults = false;
-        recognizer.maxAlternatives = 1;
-        recognizer.onresult = (event) => {
-          const transcript = event.results[0][0].transcript;
-          document.getElementById("transcriptBox").value = transcript;
-        };
-        recognizer.onerror = (event) => {
-          alert(`Speech recognition error: ${event.error}`);
-        };
-        // Listens only for this single check-in utterance, then stops -
-        // this is not a continuously-listening wake-word feature.
-        recognizer.start();
-      }
-
-      async function shareLocation() {
-        if (!requireEvent()) return;
-        if (!navigator.geolocation) {
-          alert("Geolocation isn't available in this browser.");
-          return;
-        }
-        navigator.geolocation.getCurrentPosition(
-          async (position) => {
-            await request(`/api/events/${activeEventId}/location`, {
-              method: "POST",
-              body: JSON.stringify({
-                latitude: position.coords.latitude,
-                longitude: position.coords.longitude,
-              }),
-            });
-          },
-          (error) => alert(`Could not get location: ${error.message}`),
-        );
-      }
-
-      refresh();
-    </script>
-  </body>
+  <div id="toastRegion" class="toast-region" aria-live="polite" aria-atomic="true"></div>
+</body>
 </html>

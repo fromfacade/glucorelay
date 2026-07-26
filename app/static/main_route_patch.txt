@@ -1,0 +1,13 @@
+Add this route below your existing home() route in main.py:
+
+@app.get("/caregiver", include_in_schema=False)
+def caregiver() -> FileResponse:
+    return FileResponse(STATIC_DIR / "caregiver.html")
+
+Then update the caregiver links in both HTML files from:
+/static/caregiver.html
+
+to:
+/caregiver
+
+The static URL already works without this optional route.
