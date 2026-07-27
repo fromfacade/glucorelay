@@ -12,7 +12,7 @@
   <header class="topbar">
     <a class="brand" href="/"><span class="brand-mark">G</span><span><strong>GlucoRelay</strong><small>Caregiver console</small></span></a>
     <nav class="top-actions"><span id="connectionPill" class="pill pill-neutral">Connecting</span>
-      <button id="audioToggleBtn" class="button button-ghost audio-toggle" type="button" aria-pressed="true">Audio on</button><a class="button button-ghost" href="/">Patient view</a></nav>
+      <button id="audioToggleBtn" class="button button-ghost audio-toggle" type="button" aria-pressed="true">Voice alerts on</button><a class="button button-ghost" href="/">Patient view</a></nav>
   </header>
   <main class="shell caregiver-shell">
     <section class="demo-notice"><strong>Demo caregiver console.</strong> Updates automatically from the patient dashboard.</section>
@@ -27,19 +27,31 @@
     <section class="caregiver-grid">
       <article class="card">
         <div class="card-heading"><div><p class="eyebrow">Response</p><h2>Caregiver actions</h2></div><span id="caregiverStatus" class="status-badge">Idle</span></div>
-        <label class="field"><span>Your name</span><input id="caregiverName" maxlength="80" value="Luis" autocomplete="name"></label>
+        <label class="field"><span>Your name</span><input id="caregiverName" maxlength="80" value="Helper" autocomplete="name"></label>
         <div class="action-grid">
           <button id="acknowledgeBtn" class="button button-primary" disabled>Acknowledge alert</button>
           <button id="caregiverResolveBtn" class="button button-success" disabled>Mark resolved</button>
         </div>
-        <p id="acknowledgedText" class="helper">No caregiver acknowledgement yet.</p>
+        <p id="acknowledgedText" class="helper" aria-live="polite">No caregiver acknowledgement yet.</p>
+        <p id="caregiverErrorText" class="helper error-text" aria-live="polite" hidden></p>
+      </article>
+      <article class="card wide-card">
+        <div class="card-heading"><div><p class="eyebrow">Gemma handoff</p><h2>Patient check-in</h2></div></div>
+        <p id="caregiverHandoffHeadline" class="gemma-handoff-headline muted">No patient response was provided.</p>
+        <p id="caregiverHandoffText" class="helper"></p>
+        <dl class="detail-list">
+          <div><dt>Requested contact</dt><dd id="caregiverRequestedContact">--</dd></div>
+          <div><dt>Reported condition</dt><dd id="caregiverReportedCondition">--</dd></div>
+          <div><dt>Reported action</dt><dd id="caregiverReportedAction">--</dd></div>
+          <div><dt>Supply location</dt><dd id="caregiverSupplyLocation">--</dd></div>
+        </dl>
       </article>
       <article class="card">
         <div class="card-heading"><div><p class="eyebrow">Timeline</p><h2>Current event</h2></div></div>
         <dl class="detail-list">
           <div><dt>Opened</dt><dd id="openedAt">--</dd></div>
           <div><dt>Last update</dt><dd id="updatedAt">--</dd></div>
-          <div><dt>Patient response</dt><dd id="patientResponse">--</dd></div>
+          <div><dt>Patient response summary</dt><dd id="patientResponse">--</dd></div>
           <div><dt>Event ID</dt><dd id="caregiverEventId">--</dd></div>
         </dl>
       </article>

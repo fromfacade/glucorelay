@@ -1,28 +1,45 @@
 const page = document.body.dataset.page;
-const POLL_MS = 2500;
-const COUNTDOWN_SECONDS = 30;
+const POLL_MS = 1500;
+const DEFAULT_CAREGIVER_NAME = "Helper";
 let state = null;
 let activeEventId = null;
-let countdownTimer = null;
-let countdownEventId = null;
-let timeoutRequested = false;
+let countdownInterval = null;
+let lastCountdownCue = null;
+let gemmaSubmitting = false;
+let gemmaResultEventId = null;
 let audioEnabled = localStorage.getItem("glucorelayAudioEnabled") !== "false";
 let audioUnlocked = false;
 let lastSpokenEventKey = sessionStorage.getItem("glucorelayLastSpokenEventKey") || "";
 let lastCaregiverEventKey = sessionStorage.getItem("glucorelayLastCaregiverEventKey") || "";
-let lastCountdownCue = null;
 let sessionReadings = JSON.parse(sessionStorage.getItem("glucorelayReadings") || "[]");
 
 const $ = (id) => document.getElementById(id);
 const fmt = (value) => String(value || "").replaceAll("_", " ");
 const formatTime = (iso) => iso ? new Intl.DateTimeFormat(undefined,{hour:"numeric",minute:"2-digit",second:"2-digit"}).format(new Date(iso)) : "--";
 
+// Handles both FastAPI error shapes this backend can return:
+//   {"detail": "message"}
+//   {"detail": {"message": "...", "current_status": "...", "allowed_transitions": [...]}}
+function getApiError(data) {
+  if (typeof data?.detail === "string") return data.detail;
+  if (data?.detail?.message) return data.detail.message;
+  if (data?.detail?.current_status) {
+    return `This action is no longer available. Current status: ${data.detail.current_status}.`;
+  }
+  return "Request failed.";
+}
+
 async function api(path, options = {}) {
   const response = await fetch(path, {headers:{"Content-Type":"application/json"}, ...options});
   let data = null;
   try { data = await response.json(); } catch { data = {}; }
   if ($("apiOutput")) $("apiOutput").textContent = JSON.stringify(data, null, 2);
-  if (!response.ok) throw new Error(data.detail || `Request failed (${response.status})`);
+  if (!response.ok) {
+    const error = new Error(getApiError(data));
+    error.status = response.status;
+    error.data = data;
+    throw error;
+  }
   return data;
 }
 
@@ -36,11 +53,10 @@ function toast(message, type = "info") {
   setTimeout(() => item.remove(), 4200);
 }
 
-
 function updateAudioButton() {
   const button = $("audioToggleBtn");
   if (!button) return;
-  button.textContent = audioEnabled ? "Audio on" : "Audio off";
+  button.textContent = audioEnabled ? "Voice alerts on" : "Voice alerts off";
   button.setAttribute("aria-pressed", String(audioEnabled));
   button.title = audioEnabled
     ? "Disable spoken alerts and tones"
@@ -117,7 +133,9 @@ function announcePatientEvent(event, thresholds) {
   playAlertTone(level);
   if (event.status === "contacting") {
     speak(`Urgent glucose alert. The reading is ${value} milligrams per deciliter. Caregiver contact has started.`);
-  } else {
+  } else if (event.status === "acknowledged") {
+    speak(`${event.acknowledged_by || DEFAULT_CAREGIVER_NAME} is responding.`);
+  } else if (event.status === "check_in_required") {
     speak(`Glucose warning. The reading is ${value} milligrams per deciliter. Please respond before the countdown ends.`);
   }
 }
@@ -132,7 +150,7 @@ function announceCaregiverEvent(event) {
     playAlertTone("urgent");
     speak(`New GlucoRelay alert. Patient glucose is ${event.latest_reading.value_mg_dl} milligrams per deciliter. Acknowledgement is requested.`);
   } else if (event.status === "acknowledged") {
-    speak(`Alert acknowledged by ${event.acknowledged_by || "the caregiver"}.`);
+    speak(`Alert acknowledged by ${event.acknowledged_by || DEFAULT_CAREGIVER_NAME}.`);
   }
 }
 
@@ -195,10 +213,35 @@ function renderHistory(history = []) {
     </div>`).join("");
 }
 
-function updatePatient(s) {
+// --- Patient dashboard: a single state-driven renderer ---------------------
+//
+// `renderApp` is the only place that decides what's visible on the patient
+// dashboard. Every sub-renderer derives its output from the backend event
+// object (never from which button was last clicked), so the UI can never
+// get stuck showing a prompt/countdown/form the backend no longer considers
+// active - it's corrected on the very next poll regardless of what caused
+// the status to change (a button, a Gemma check-in, a backend timeout, or
+// the caregiver acknowledging from a different tab).
+
+function renderApp(s) {
+  state = s;
+  const event = s.active_event;
+  activeEventId = event?.id ?? null;
+
+  renderReading(s);
+  renderWorkflow(event?.status);
+  renderPatientControls(event);
+  renderGemmaCheckIn(event);
+  renderOverlay(event);
+  renderHistory(s.history);
+  drawChart(s.thresholds);
+  startCountdown(event);
+  announcePatientEvent(event, s.thresholds);
+}
+
+function renderReading(s) {
   const reading = s.latest_reading;
   const event = s.active_event;
-  activeEventId = event?.id || null;
   recordSessionReading(reading);
   const level = readingClass(reading, s.thresholds);
   $("readingCard").className = `card reading-card state-${level}`;
@@ -213,57 +256,289 @@ function updatePatient(s) {
   $("eventTitle").textContent = event ? "Emergency workflow active" : "No active event";
   $("eventStatus").textContent = event ? fmt(event.status) : "Idle";
   $("eventReason").textContent = event?.reason || "A warning will appear automatically when the rules engine detects an abnormal reading.";
-  renderWorkflow(event?.status);
-
-  const patientCanRespond = Boolean(event && ["check_in_required","monitoring","contacting"].includes(event.status));
-  $("treatingBtn").disabled = !patientCanRespond;
-  $("helpBtn").disabled = !patientCanRespond;
-  $("falseAlarmBtn").disabled = !patientCanRespond;
-  $("timeoutBtn").disabled = !event || !["check_in_required","monitoring"].includes(event.status);
-  $("resolveBtn").disabled = !event;
-  renderHistory(s.history);
-  drawChart(s.thresholds);
-  updateOverlay(event);
-  announcePatientEvent(event, s.thresholds);
 }
 
-function updateOverlay(event) {
-  const overlay = $("emergencyOverlay"); if (!overlay) return;
+function showCheckInPrompt() {
+  $("checkInPrompt").hidden = false;
+  $("patientStatusMessage").hidden = true;
+}
+
+function hideCheckInPrompt() {
+  $("checkInPrompt").hidden = true;
+}
+
+function showPatientStatusMessage(text) {
+  const el = $("patientStatusMessage");
+  if (!el) return;
+  el.hidden = false;
+  el.textContent = text;
+}
+
+// The prompt (the three response buttons + the Gemma check-in form) is only
+// ever visible while `event.status === "check_in_required"` - every other
+// status hides it here, in one place, instead of leaving visibility to
+// whichever button handler last ran.
+function renderPatientControls(event) {
+  const treatingBtn = $("treatingBtn");
+  const helpBtn = $("helpBtn");
+  const falseAlarmBtn = $("falseAlarmBtn");
+  const resolveBtn = $("resolveBtn");
+  const timeoutBtn = $("timeoutBtn");
+
+  const checkInActive = event?.status === "check_in_required";
+  treatingBtn.disabled = !checkInActive;
+  helpBtn.disabled = !checkInActive;
+  falseAlarmBtn.disabled = !checkInActive;
+
+  switch (event?.status) {
+    case "check_in_required":
+      showCheckInPrompt();
+      resolveBtn.disabled = false;
+      break;
+    case "monitoring":
+      hideCheckInPrompt();
+      showPatientStatusMessage("Check-in received. GlucoRelay will continue monitoring the event.");
+      resolveBtn.disabled = false;
+      break;
+    case "contacting":
+      hideCheckInPrompt();
+      showPatientStatusMessage("Caregiver contact has started. Waiting for acknowledgement from the caregiver console.");
+      resolveBtn.disabled = false;
+      break;
+    case "acknowledged":
+      hideCheckInPrompt();
+      showPatientStatusMessage(`${event.acknowledged_by || DEFAULT_CAREGIVER_NAME} is responding.`);
+      resolveBtn.disabled = false;
+      break;
+    case "resolved":
+      hideCheckInPrompt();
+      showPatientStatusMessage("This event has been resolved.");
+      resolveBtn.disabled = true;
+      break;
+    default:
+      hideCheckInPrompt();
+      showPatientStatusMessage("No active event. Submit a reading to begin a demo scenario.");
+      resolveBtn.disabled = true;
+  }
+
+  timeoutBtn.disabled = !event || !["check_in_required","monitoring"].includes(event.status);
+}
+
+// --- AI-assisted (Gemma) check-in -------------------------------------------
+
+function renderGemmaCheckIn(event) {
+  const form = $("gemmaForm");
+  const notice = $("gemmaDisabledNotice");
+  const textarea = $("gemmaTranscript");
+  const submitBtn = $("gemmaSubmitBtn");
+  const active = Boolean(event && event.status === "check_in_required");
+
+  form.hidden = !active;
+  notice.hidden = active;
+  if (!active) {
+    notice.textContent = event
+      ? "The AI-assisted check-in is only available while a check-in is required."
+      : "A concerning reading must be detected first before an AI-assisted check-in is available.";
+  }
+
+  textarea.disabled = !active || gemmaSubmitting;
+  submitBtn.disabled = !active || gemmaSubmitting || !textarea.value.trim();
+
+  // Clear a previous result/status once the event has moved on (a new
+  // reading, a reset, or a resolved event) so a stale AI response is never
+  // shown for a different event.
+  if (event?.id !== gemmaResultEventId) {
+    gemmaResultEventId = null;
+    $("gemmaResult").hidden = true;
+    setGemmaStatus("");
+  }
+}
+
+function setGemmaStatus(text, kind = "") {
+  const el = $("gemmaStatus");
+  if (!el) return;
+  el.textContent = text;
+  el.className = `gemma-status${kind ? ` status-${kind}` : ""}`;
+}
+
+function renderGemmaResult(data) {
+  // Defensively support both possible response shapes for the analysis and
+  // handoff payloads, per the backend contract.
+  const analysis = data.analysis || data.interpretation || null;
+  const validatedTool = data.validated_tool || null;
+  const handoffRaw = data.handoff || data.event?.caregiver_handoff || null;
+  const interpretationSource = data.source?.interpretation || null;
+  const isGemma = interpretationSource === "gemma";
+
+  $("gemmaResult").hidden = false;
+
+  $("gemmaSource").textContent = interpretationSource
+    ? (isGemma ? "Gemma 4" : "Deterministic fallback (Gemma was unavailable)")
+    : "Unknown";
+  $("gemmaSummary").textContent = analysis?.summary || "Not stated";
+  $("gemmaAction").textContent = analysis?.action ? fmt(analysis.action) : "Not stated";
+  $("gemmaContact").textContent = analysis?.requested_contact || "Not stated";
+  $("gemmaCondition").textContent = analysis?.reported_condition || "Not stated";
+  $("gemmaReportedAction").textContent = analysis?.reported_action || "Not stated";
+  $("gemmaSupplyLocation").textContent = analysis?.supply_location || "Not stated";
+  $("gemmaLanguage").textContent = analysis?.detected_language || "Not stated";
+  $("gemmaValidatedTool").textContent = validatedTool ? fmt(validatedTool.name) : "No action taken (unclear response)";
+
+  const handoffText = typeof handoffRaw === "string" ? handoffRaw : handoffRaw?.handoff;
+  const handoffHeadline = (handoffRaw && typeof handoffRaw === "object") ? handoffRaw.headline : null;
+  const handoffBlock = $("gemmaHandoffBlock");
+  if (handoffText) {
+    handoffBlock.hidden = false;
+    $("gemmaHandoffHeadline").textContent = handoffHeadline || "Caregiver handoff";
+    $("gemmaHandoffText").textContent = handoffText;
+  } else {
+    handoffBlock.hidden = true;
+  }
+
+  if (!interpretationSource) {
+    setGemmaStatus("Check-in processed.", "success");
+  } else if (isGemma) {
+    setGemmaStatus("Check-in interpreted successfully with Gemma 4.", "success");
+  } else {
+    setGemmaStatus("Gemma was unavailable. Emergency fallback mode was used.", "fallback");
+  }
+}
+
+async function submitGemmaCheckIn(domEvent) {
+  domEvent.preventDefault();
+  if (gemmaSubmitting) return;
+
+  if (!activeEventId) {
+    toast("No active event to check in on.", "error");
+    return;
+  }
+  const transcript = $("gemmaTranscript").value.trim();
+  if (!transcript) {
+    toast("Describe how you're feeling before analyzing.", "error");
+    return;
+  }
+
+  const submittedForEventId = activeEventId;
+  gemmaSubmitting = true;
+  $("gemmaSubmitBtn").disabled = true;
+  $("gemmaTranscript").disabled = true;
+  $("gemmaResult").hidden = true;
+  setGemmaStatus("Gemma is interpreting your check-in…", "loading");
+
+  try {
+    const data = await api(`/api/events/${submittedForEventId}/voice-check-in`, {
+      method: "POST",
+      body: JSON.stringify({ transcript, language: "en-US" }),
+    });
+    gemmaResultEventId = submittedForEventId;
+    renderGemmaResult(data);
+    await refresh();
+  } catch (error) {
+    const message = error.status === 409
+      ? "The check-in expired while the response was being processed."
+      : error.message || "Request failed.";
+    setGemmaStatus(message, "error");
+    toast(message, "error");
+    await refresh();
+  } finally {
+    gemmaSubmitting = false;
+    // Re-enable the input only if the event is still check_in_required -
+    // renderGemmaCheckIn (already called by refresh() -> renderApp) is the
+    // single source of truth for that, so just re-run it defensively in
+    // case refresh() itself failed to reach the server.
+    renderGemmaCheckIn(state?.active_event || null);
+  }
+}
+
+// --- Emergency overlay -------------------------------------------------------
+
+function renderOverlay(event) {
+  const overlay = $("emergencyOverlay");
+  if (!overlay) return;
   const show = Boolean(event && event.status === "check_in_required");
   overlay.hidden = !show;
   document.body.style.overflow = show ? "hidden" : "";
-  if (!show) { stopCountdown(); return; }
+  if (!show) return;
   $("overlayReading").textContent = `${event.latest_reading.value_mg_dl} mg/dL`;
   $("overlayReason").textContent = event.reason;
-  if (countdownEventId !== event.id) startCountdown(event.id);
 }
 
-function startCountdown(eventId) {
-  stopCountdown();
-  countdownEventId = eventId;
-  timeoutRequested = false;
-  lastCountdownCue = null;
-  let remaining = COUNTDOWN_SECONDS;
-  speak(`Glucose warning. Caregiver escalation begins in ${COUNTDOWN_SECONDS} seconds.`);
-  $("countdownValue").textContent = remaining;
-  countdownTimer = setInterval(async () => {
-    remaining -= 1;
-    if ($("countdownValue")) $("countdownValue").textContent = Math.max(remaining,0);
-    if ([10, 5, 4, 3, 2, 1].includes(remaining) && lastCountdownCue !== remaining) {
-      lastCountdownCue = remaining;
-      speak(String(remaining), { interrupt: false, rate: 1 });
-    }
-    if (remaining <= 0) {
-      stopCountdown();
-      if (!timeoutRequested && activeEventId === eventId) {
-        timeoutRequested = true;
-        try { await eventAction("timeout"); toast("No response detected. Caregiver contact started."); }
-        catch (error) { toast(error.message,"error"); }
-      }
-    }
-  },1000);
+// --- Countdown (backend deadline is the source of truth) --------------------
+//
+// The backend's own asyncio timer (see app/main.py::schedule_check_in_timeout)
+// is the only thing that actually escalates the event on timeout - this is
+// presentation only. It never runs an independent 30-second clock: it reads
+// `check_in_deadline` from the active event and recomputes the remaining
+// time from the current browser clock every tick, so it can never drift
+// from the backend and always reflects the real deadline after every poll.
+
+function clearCountdownDisplay() {
+  const countdownText = $("countdownText");
+  if (countdownText) { countdownText.hidden = true; countdownText.textContent = ""; }
+  const overlayValue = $("countdownValue");
+  if (overlayValue) overlayValue.textContent = "--";
+  const overlayText = $("overlayCountdownText");
+  if (overlayText) overlayText.textContent = "Caregiver escalation begins if there is no response.";
 }
-function stopCountdown(){ if(countdownTimer) clearInterval(countdownTimer); countdownTimer=null; countdownEventId=null; lastCountdownCue=null; }
+
+function renderCountdown(remainingSeconds, event) {
+  const contactName = event?.requested_contact || DEFAULT_CAREGIVER_NAME;
+  const message = `Contacting ${contactName} in ${remainingSeconds} second${remainingSeconds === 1 ? "" : "s"}`;
+
+  const countdownText = $("countdownText");
+  if (countdownText) { countdownText.hidden = false; countdownText.textContent = message; }
+  const overlayValue = $("countdownValue");
+  if (overlayValue) overlayValue.textContent = String(remainingSeconds);
+  const overlayText = $("overlayCountdownText");
+  if (overlayText) overlayText.textContent = message;
+
+  if ([10, 5, 4, 3, 2, 1].includes(remainingSeconds) && lastCountdownCue !== remainingSeconds) {
+    lastCountdownCue = remainingSeconds;
+    speak(String(remainingSeconds), { interrupt: false, rate: 1 });
+  }
+}
+
+function stopCountdown() {
+  if (countdownInterval) {
+    clearInterval(countdownInterval);
+    countdownInterval = null;
+  }
+  lastCountdownCue = null;
+}
+
+function startCountdown(event) {
+  stopCountdown();
+
+  if (
+    !event ||
+    event.status !== "check_in_required" ||
+    !event.check_in_deadline
+  ) {
+    clearCountdownDisplay();
+    return;
+  }
+
+  function updateCountdown() {
+    const deadline = new Date(event.check_in_deadline).getTime();
+    const now = Date.now();
+    const remainingSeconds = Math.max(
+      0,
+      Math.ceil((deadline - now) / 1000)
+    );
+
+    renderCountdown(remainingSeconds, event);
+
+    if (remainingSeconds <= 0) {
+      stopCountdown();
+      // The frontend never escalates on its own - it just asks the backend
+      // what actually happened once the deadline is reached.
+      setTimeout(refresh, 500);
+    }
+  }
+
+  updateCountdown();
+  countdownInterval = setInterval(updateCountdown, 1000);
+}
 
 function drawChart(thresholds) {
   const canvas = $("glucoseChart"); if (!canvas) return;
@@ -286,27 +561,82 @@ function drawChart(thresholds) {
   sessionReadings.forEach((r,i)=>{const level=readingClass(r,thresholds);ctx.fillStyle=level==="urgent"?"#ff6b7a":level==="warning"?"#ffc96b":"#4dd6a4";ctx.beginPath();ctx.arc(x(i),y(r.value_mg_dl),4,0,Math.PI*2);ctx.fill()});
 }
 
+// --- Caregiver console -------------------------------------------------------
+
+function showCaregiverError(message) {
+  const el = $("caregiverErrorText");
+  if (!el) return;
+  el.hidden = !message;
+  el.textContent = message || "";
+}
+
+// Priority for the headline caregiver-facing text: the Gemma-generated
+// handoff object's `.handoff` text, then a plain-string `caregiver_handoff`
+// (defensive - some backend shapes return it pre-flattened), then the raw
+// patient response summary, then a safe default.
+function resolveHandoffText(event) {
+  const handoff = event?.caregiver_handoff;
+  if (handoff && typeof handoff === "object" && handoff.handoff) return handoff.handoff;
+  if (typeof handoff === "string" && handoff) return handoff;
+  if (event?.patient_response_summary) return event.patient_response_summary;
+  return "No patient response was provided.";
+}
+
+function renderCaregiverHandoff(event) {
+  const handoff = event?.caregiver_handoff;
+  const handoffObject = handoff && typeof handoff === "object" ? handoff : null;
+  const handoffText = resolveHandoffText(event);
+  const hasRealHandoff = handoffText !== "No patient response was provided.";
+
+  $("caregiverHandoffHeadline").textContent = hasRealHandoff
+    ? (handoffObject?.headline || "Patient check-in")
+    : handoffText;
+  $("caregiverHandoffText").textContent = hasRealHandoff ? handoffText : "";
+
+  const defaultableStatuses = ["contacting", "acknowledged", "resolved"];
+  const contact = event?.requested_contact
+    || handoffObject?.requested_contact
+    || (event && defaultableStatuses.includes(event.status) ? DEFAULT_CAREGIVER_NAME : null);
+
+  $("caregiverRequestedContact").textContent = contact || "Not stated";
+  $("caregiverReportedCondition").textContent = event?.reported_condition || handoffObject?.reported_condition || "Not stated";
+  $("caregiverReportedAction").textContent = event?.reported_action || handoffObject?.reported_action || "Not stated";
+  $("caregiverSupplyLocation").textContent = event?.supply_location || handoffObject?.supply_location || "Not stated";
+}
+
 function updateCaregiver(s) {
-  const event=s.active_event; activeEventId=event?.id||null;
-  const level=readingClass(event?.latest_reading,s.thresholds);
-  $("caregiverHero").className=`card caregiver-hero state-${level}`;
-  $("caregiverTitle").textContent=event?"Patient alert active":"No active emergency";
-  $("caregiverReason").textContent=event?.reason||"Waiting for an event from the patient dashboard.";
-  $("caregiverReading").textContent=event?.latest_reading.value_mg_dl??"--";
-  $("caregiverTrend").textContent=event?fmt(event.latest_reading.trend):"No trend";
-  $("caregiverStatus").textContent=event?fmt(event.status):"Idle";
-  $("acknowledgeBtn").disabled=!event||event.status!=="contacting";
-  $("caregiverResolveBtn").disabled=!event;
-  $("acknowledgedText").textContent=event?.acknowledged_by?`Acknowledged by ${event.acknowledged_by}.`:"No caregiver acknowledgement yet.";
-  $("openedAt").textContent=formatTime(event?.opened_at); $("updatedAt").textContent=formatTime(event?.updated_at);
-  $("patientResponse").textContent=fmt(event?.patient_response||"No response"); $("caregiverEventId").textContent=event?.id||"--";
+  state = s;
+  const event = s.active_event; activeEventId = event?.id || null;
+  const level = readingClass(event?.latest_reading, s.thresholds);
+  $("caregiverHero").className = `card caregiver-hero state-${level}`;
+  $("caregiverTitle").textContent = event ? "Patient alert active" : "No active emergency";
+  $("caregiverReason").textContent = event?.reason || "Waiting for an event from the patient dashboard.";
+  $("caregiverReading").textContent = event?.latest_reading.value_mg_dl ?? "--";
+  $("caregiverTrend").textContent = event ? fmt(event.latest_reading.trend) : "No trend";
+  $("caregiverStatus").textContent = event ? fmt(event.status) : "Idle";
+  $("acknowledgeBtn").disabled = !event || event.status !== "contacting";
+  $("caregiverResolveBtn").disabled = !event;
+  $("acknowledgedText").textContent = event?.acknowledged_by
+    ? `${event.acknowledged_by} is responding.`
+    : "No caregiver acknowledgement yet.";
+  $("openedAt").textContent = formatTime(event?.opened_at);
+  $("updatedAt").textContent = formatTime(event?.updated_at);
+  $("patientResponse").textContent = event?.patient_response_summary || fmt(event?.patient_response || "No response");
+  $("caregiverEventId").textContent = event?.id || "--";
+  renderCaregiverHandoff(event);
   renderHistory(s.history);
   announceCaregiverEvent(event);
 }
 
 async function refresh() {
-  try { state=await api("/api/state"); setConnection(true); page==="caregiver"?updateCaregiver(state):updatePatient(state); }
-  catch(error){setConnection(false);console.error(error)}
+  try {
+    const s = await api("/api/state");
+    setConnection(true);
+    if (page === "caregiver") updateCaregiver(s); else renderApp(s);
+  } catch (error) {
+    setConnection(false);
+    console.error(error);
+  }
 }
 
 async function submitReading(value, trend) {
@@ -320,10 +650,8 @@ async function submitReading(value, trend) {
 async function patientResponse(response) {
   if (!activeEventId) return;
 
-  const overlay = $("emergencyOverlay");
-  if (overlay) overlay.hidden = true;
-  document.body.style.overflow = "";
-  stopCountdown();
+  [$("treatingBtn"),$("helpBtn"),$("falseAlarmBtn"),$("overlayTreatingBtn"),$("overlayHelpBtn"),$("overlayFalseBtn")]
+    .forEach((button) => { if (button) button.disabled = true; });
 
   try {
     await api(`/api/events/${activeEventId}/patient-response`, {
@@ -353,15 +681,32 @@ function bindPatient() {
   [["treatingBtn","treating"],["overlayTreatingBtn","treating"],["helpBtn","need_help"],["overlayHelpBtn","need_help"],["falseAlarmBtn","false_alarm"],["overlayFalseBtn","false_alarm"]].forEach(([id,response])=>$(id)?.addEventListener("click",()=>patientResponse(response)));
   $("timeoutBtn")?.addEventListener("click",()=>eventAction("timeout").catch(e=>toast(e.message,"error")));
   $("resolveBtn")?.addEventListener("click",()=>eventAction("resolve").then(()=>toast("Event resolved.")).catch(e=>toast(e.message,"error")));
-  $("resetBtn")?.addEventListener("click",async()=>{try{await api("/api/reset",{method:"POST"});sessionReadings=[];sessionStorage.removeItem("glucorelayReadings");stopCountdown();await refresh();toast("Demo reset.")}catch(e){toast(e.message,"error")}});
+  $("resetBtn")?.addEventListener("click",async()=>{try{await api("/api/reset",{method:"POST"});sessionReadings=[];sessionStorage.removeItem("glucorelayReadings");gemmaResultEventId=null;stopCountdown();await refresh();toast("Demo reset.")}catch(e){toast(e.message,"error")}});
   $("clearChartBtn")?.addEventListener("click",()=>{sessionReadings=[];sessionStorage.removeItem("glucorelayReadings");drawChart(state?.thresholds||{low:70,high:250});});
+  $("gemmaForm")?.addEventListener("submit", submitGemmaCheckIn);
+  $("gemmaTranscript")?.addEventListener("input", () => renderGemmaCheckIn(state?.active_event || null));
   window.addEventListener("resize",()=>state&&drawChart(state.thresholds));
 }
 
 function bindCaregiver(){
   $("audioToggleBtn")?.addEventListener("click", toggleAudio);
-  $("acknowledgeBtn")?.addEventListener("click",async()=>{const name=$("caregiverName")?.value.trim() || "";if(!name){toast("Enter the caregiver name.","error");return}try{await eventAction("acknowledge",{caregiver_name:name});toast("Alert acknowledged.");speak("Caregiver acknowledgement recorded.")}catch(e){toast(e.message,"error")}});
-  $("caregiverResolveBtn")?.addEventListener("click",()=>eventAction("resolve").then(()=>toast("Event resolved.")).catch(e=>toast(e.message,"error")));
+  $("acknowledgeBtn")?.addEventListener("click",async()=>{
+    const name=$("caregiverName")?.value.trim() || "";
+    if(!name){toast("Enter the caregiver name.","error");return}
+    showCaregiverError(null);
+    try{
+      await eventAction("acknowledge",{caregiver_name:name});
+      toast("Alert acknowledged.");
+      speak("Caregiver acknowledgement recorded.");
+    }catch(e){
+      showCaregiverError(e.message);
+      toast(e.message,"error");
+    }
+  });
+  $("caregiverResolveBtn")?.addEventListener("click",()=>{
+    showCaregiverError(null);
+    eventAction("resolve").then(()=>toast("Event resolved.")).catch(e=>{showCaregiverError(e.message);toast(e.message,"error")});
+  });
 }
 
 document.addEventListener("DOMContentLoaded",()=>{
