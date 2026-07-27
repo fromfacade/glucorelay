@@ -16,7 +16,7 @@
     </a>
     <nav class="top-actions" aria-label="Primary navigation">
       <span id="connectionPill" class="pill pill-neutral">Connecting</span>
-      <button id="audioToggleBtn" class="button button-ghost audio-toggle" type="button" aria-pressed="true">Audio on</button>
+      <button id="audioToggleBtn" class="button button-ghost audio-toggle" type="button" aria-pressed="true">Voice alerts on</button>
       <a class="button button-ghost" href="/caregiver">Caregiver view</a>
     </nav>
   </header>
@@ -110,10 +110,20 @@
     <section class="content-grid lower-grid">
       <article class="card actions-card">
         <div class="card-heading"><div><p class="eyebrow">Patient response</p><h2>What is happening?</h2></div></div>
-        <div class="action-grid">
-          <button id="treatingBtn" class="button button-primary" disabled>I'm treating it</button>
-          <button id="helpBtn" class="button button-danger" disabled>I need help</button>
-          <button id="falseAlarmBtn" class="button button-ghost" disabled>False alarm</button>
+
+        <p id="countdownText" class="countdown-text" aria-live="polite" hidden></p>
+
+        <div id="checkInPrompt" hidden>
+          <div class="action-grid">
+            <button id="treatingBtn" class="button button-primary" disabled>I'm treating it</button>
+            <button id="helpBtn" class="button button-danger" disabled>I need help</button>
+            <button id="falseAlarmBtn" class="button button-ghost" disabled>False alarm</button>
+          </div>
+        </div>
+
+        <p id="patientStatusMessage" class="helper status-message" aria-live="polite" hidden></p>
+
+        <div class="action-grid resolve-row">
           <button id="resolveBtn" class="button button-success" disabled>Resolve event</button>
         </div>
       </article>
@@ -121,6 +131,49 @@
       <article class="card history-card">
         <div class="card-heading"><div><p class="eyebrow">Audit trail</p><h2>Recent events</h2></div></div>
         <div id="historyList" class="history-list"><p class="muted">No resolved events yet.</p></div>
+      </article>
+    </section>
+
+    <section class="content-grid">
+      <article id="gemmaCard" class="card gemma-card">
+        <div class="card-heading">
+          <div><p class="eyebrow">AI-assisted check-in</p><h2>Tell Gemma what's happening</h2></div>
+        </div>
+        <p class="muted">
+          Describe how you're feeling in your own words (English or Spanish are both
+          understood). Gemma 4 interprets the transcript and proposes one safe next
+          step - the backend independently verifies everything before anything changes.
+        </p>
+        <p id="gemmaDisabledNotice" class="helper" hidden></p>
+        <form id="gemmaForm" class="gemma-form" hidden>
+          <label for="gemmaTranscript">Describe how you're feeling</label>
+          <textarea
+            id="gemmaTranscript"
+            rows="3"
+            maxlength="2000"
+            placeholder="Example: I feel confused. Please contact Helper. My glucagon is in my red backpack."
+          ></textarea>
+          <button id="gemmaSubmitBtn" class="button button-primary" type="submit" disabled>Analyze with Gemma</button>
+        </form>
+        <p id="gemmaStatus" class="gemma-status" aria-live="polite"></p>
+        <div id="gemmaResult" class="gemma-result" hidden>
+          <dl class="detail-list">
+            <div><dt>Interpretation source</dt><dd id="gemmaSource">--</dd></div>
+            <div><dt>Summary</dt><dd id="gemmaSummary">--</dd></div>
+            <div><dt>Action</dt><dd id="gemmaAction">--</dd></div>
+            <div><dt>Requested contact</dt><dd id="gemmaContact">--</dd></div>
+            <div><dt>Reported condition</dt><dd id="gemmaCondition">--</dd></div>
+            <div><dt>Reported action</dt><dd id="gemmaReportedAction">--</dd></div>
+            <div><dt>Supply location</dt><dd id="gemmaSupplyLocation">--</dd></div>
+            <div><dt>Detected language</dt><dd id="gemmaLanguage">--</dd></div>
+            <div><dt>Validated application action</dt><dd id="gemmaValidatedTool">--</dd></div>
+          </dl>
+          <div id="gemmaHandoffBlock" class="gemma-handoff" hidden>
+            <p class="eyebrow">Caregiver handoff</p>
+            <p id="gemmaHandoffHeadline" class="gemma-handoff-headline"></p>
+            <p id="gemmaHandoffText"></p>
+          </div>
+        </div>
       </article>
     </section>
 
@@ -144,8 +197,8 @@
       <div id="overlayReading" class="overlay-reading">-- mg/dL</div>
       <p id="overlayReason" class="overlay-reason"></p>
       <div id="countdownBlock" class="countdown-block">
-        <div class="countdown-ring"><span id="countdownValue">30</span></div>
-        <p>Caregiver escalation begins if there is no response.</p>
+        <div class="countdown-ring"><span id="countdownValue">--</span></div>
+        <p id="overlayCountdownText" aria-live="polite">Caregiver escalation begins if there is no response.</p>
       </div>
       <div class="overlay-actions">
         <button id="overlayTreatingBtn" class="button button-primary">I'm treating it</button>
